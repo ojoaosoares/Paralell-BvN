@@ -48,8 +48,9 @@ EulerWorkspace& get_thread_workspace();
 
 /**
  * Sequential Eulerian split using a pre-allocated workspace (zero heap allocations for CSR buffers).
+ * Returns true if the split is 100% symmetric (E_odd == 0, so Red and Blue subgraphs are identical).
  */
-void euler_split_sequential_ws(
+bool euler_split_sequential_ws(
     const std::vector<WeightedEdge>& edges,
     int n,
     EulerWorkspace& ws,

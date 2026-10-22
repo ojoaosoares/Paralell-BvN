@@ -5,7 +5,7 @@
 
 namespace bvn {
 
-void euler_split_sequential_ws(
+bool euler_split_sequential_ws(
     const std::vector<WeightedEdge>& edges,
     int n,
     EulerWorkspace& ws,
@@ -24,56 +24,64 @@ void euler_split_sequential_ws(
         }
     }
 
+    // Symmetry Pruning: when E == 0, all weights are even so Red and Blue subtrees are 100% identical!
+    if (E == 0) {
+        out_red.clear();
+        for (const auto& e : edges) {
+            int half = e.w >> 1;
+            if (half > 0) out_red.push_back({e.u, e.v, half});
+        }
+        return true;
+    }
+
     uint8_t* odd_color = ws.odd_color.data();
 
-    if (E > 0) {
-        int* row_ptr = ws.row_ptr.data();
-        int* fill_ptr = ws.fill_ptr.data();
-        int* head = ws.head.data();
-        row_ptr[0] = 0;
-        for (int i = 0; i < 2 * n; ++i) {
-            row_ptr[i + 1] = row_ptr[i] + deg[i];
-            fill_ptr[i] = row_ptr[i];
-            head[i] = row_ptr[i];
+    int* row_ptr = ws.row_ptr.data();
+    int* fill_ptr = ws.fill_ptr.data();
+    int* head = ws.head.data();
+    row_ptr[0] = 0;
+    for (int i = 0; i < 2 * n; ++i) {
+        row_ptr[i + 1] = row_ptr[i] + deg[i];
+        fill_ptr[i] = row_ptr[i];
+        head[i] = row_ptr[i];
+    }
+
+    FlatEdge* adj = ws.adj.data();
+    int odd_id = 0;
+    for (const auto& e : edges) {
+        if (e.w & 1) {
+            int u = e.u;
+            int v = n + e.v;
+            adj[fill_ptr[u]++] = {v, odd_id};
+            adj[fill_ptr[v]++] = {u, odd_id};
+            ++odd_id;
         }
+    }
 
-        FlatEdge* adj = ws.adj.data();
-        int odd_id = 0;
-        for (const auto& e : edges) {
-            if (e.w & 1) {
-                int u = e.u;
-                int v = n + e.v;
-                adj[fill_ptr[u]++] = {v, odd_id};
-                adj[fill_ptr[v]++] = {u, odd_id};
-                ++odd_id;
-            }
-        }
+    uint8_t* used = ws.used.data();
+    std::fill(used, used + E, 0);
 
-        uint8_t* used = ws.used.data();
-        std::fill(used, used + E, 0);
-
-        for (int root = 0; root < n; ++root) {
-            while (head[root] < row_ptr[root + 1]) {
-                int curr = root;
-                uint8_t color = 0;
-                while (true) {
-                    int chosen_id = -1;
-                    int next_v = -1;
-                    while (head[curr] < row_ptr[curr + 1]) {
-                        const FlatEdge& fe = adj[head[curr]++];
-                        if (!used[fe.edge_id]) {
-                            used[fe.edge_id] = 1;
-                            chosen_id = fe.edge_id;
-                            next_v = fe.to;
-                            break;
-                        }
+    for (int root = 0; root < n; ++root) {
+        while (head[root] < row_ptr[root + 1]) {
+            int curr = root;
+            uint8_t color = 0;
+            while (true) {
+                int chosen_id = -1;
+                int next_v = -1;
+                while (head[curr] < row_ptr[curr + 1]) {
+                    const FlatEdge& fe = adj[head[curr]++];
+                    if (!used[fe.edge_id]) {
+                        used[fe.edge_id] = 1;
+                        chosen_id = fe.edge_id;
+                        next_v = fe.to;
+                        break;
                     }
-                    if (chosen_id == -1) break;
-                    odd_color[chosen_id] = color;
-                    color ^= 1;
-                    curr = next_v;
-                    if (curr == root) break;
                 }
+                if (chosen_id == -1) break;
+                odd_color[chosen_id] = color;
+                color ^= 1;
+                curr = next_v;
+                if (curr == root) break;
             }
         }
     }
@@ -81,7 +89,7 @@ void euler_split_sequential_ws(
     out_red.clear();
     out_blue.clear();
 
-    int odd_id = 0;
+    odd_id = 0;
     for (const auto& e : edges) {
         int half = e.w >> 1;
         int w_red = half;
@@ -97,6 +105,7 @@ void euler_split_sequential_ws(
         if (w_red > 0) out_red.push_back({e.u, e.v, w_red});
         if (w_blue > 0) out_blue.push_back({e.u, e.v, w_blue});
     }
+    return false;
 }
 
 void decompose_recursive_seq_ws(
@@ -122,11 +131,18 @@ void decompose_recursive_seq_ws(
 
     auto& red_edges = ws.level_red[depth];
     auto& blue_edges = ws.level_blue[depth];
-    euler_split_sequential_ws(edges, n, ws, red_edges, blue_edges);
+    bool symmetric = euler_split_sequential_ws(edges, n, ws, red_edges, blue_edges);
 
     int half_deg = degree >> 1;
     decompose_recursive_seq_ws(red_edges, n, half_deg, depth + 1, leaf_offset, ws, out_leaves);
-    decompose_recursive_seq_ws(blue_edges, n, half_deg, depth + 1, leaf_offset + half_deg, ws, out_leaves);
+
+    if (symmetric) {
+        for (int i = 0; i < half_deg; ++i) {
+            out_leaves[leaf_offset + half_deg + i] = out_leaves[leaf_offset + i];
+        }
+    } else {
+        decompose_recursive_seq_ws(blue_edges, n, half_deg, depth + 1, leaf_offset + half_deg, ws, out_leaves);
+    }
 }
 
 EulerWorkspace& get_thread_workspace() {
