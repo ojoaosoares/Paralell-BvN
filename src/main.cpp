@@ -20,7 +20,8 @@ void print_usage(const char* prog) {
               << "  --d <int>            Target degree D, power of 2 (default: 256)\n"
               << "  --threads <int>      Number of OpenMP threads (default: 4)\n"
               << "  --cutoff <int>       Task cut-off degree for omp_arch (default: 8)\n"
-              << "  --mode <str>         Execution mode: seq | omp_naive | omp_arch (default: omp_arch)\n"
+              << "  --blocks <int>       Spatial block grid KxK for omp_block (0 = dynamic optimal)\n"
+              << "  --mode <str>         Execution mode: seq | omp_naive | omp_arch | omp_block (default: omp_arch)\n"
               << "  --pattern <str>      Traffic pattern: uniform | skewed | bursty (default: uniform)\n"
               << "  --seed <int>         RNG seed (default: 42)\n"
               << "  --csv                Print single-line CSV output for benchmark scripts\n"
@@ -33,6 +34,7 @@ const char* mode_to_str(bvn::ExecMode m) {
         case bvn::ExecMode::SEQ: return "seq";
         case bvn::ExecMode::OMP_NAIVE: return "omp_naive";
         case bvn::ExecMode::OMP_ARCH: return "omp_arch";
+        case bvn::ExecMode::OMP_BLOCK: return "omp_block";
     }
     return "unknown";
 }
@@ -60,6 +62,8 @@ int main(int argc, char** argv) {
             cfg.num_threads = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--cutoff") == 0 && i + 1 < argc) {
             cfg.cutoff_degree = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--blocks") == 0 && i + 1 < argc) {
+            cfg.block_factor = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
             cfg.seed = static_cast<uint64_t>(std::atoll(argv[++i]));
         } else if (std::strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
@@ -67,6 +71,7 @@ int main(int argc, char** argv) {
             if (m == "seq") cfg.mode = bvn::ExecMode::SEQ;
             else if (m == "omp_naive") cfg.mode = bvn::ExecMode::OMP_NAIVE;
             else if (m == "omp_arch") cfg.mode = bvn::ExecMode::OMP_ARCH;
+            else if (m == "omp_block") cfg.mode = bvn::ExecMode::OMP_BLOCK;
             else {
                 std::cerr << "Unknown mode: " << m << "\n";
                 return 1;
@@ -105,7 +110,20 @@ int main(int argc, char** argv) {
     std::vector<int> demand_matrix = bvn::generate_traffic_matrix(cfg, stats.total_real_packets);
 
     // Warm up OpenMP thread pool and thread-local workspaces so OS pthread/mmap page faults do not skew timers
-    if (cfg.mode != bvn::ExecMode::SEQ) {
+    if (cfg.mode == bvn::ExecMode::OMP_BLOCK) {
+        int K = bvn::select_optimal_block_factor(cfg.n, cfg.num_threads, cfg.block_factor);
+        int nb = cfg.n / K;
+        #pragma omp parallel num_threads(cfg.num_threads)
+        {
+            bvn::get_thread_workspace().ensure_capacity(
+                nb, cfg.target_degree, cfg.target_degree, nb * nb
+            );
+        }
+        bvn::Config warm_cfg = cfg;
+        warm_cfg.target_degree = 0;
+        double dummy1 = 0.0, dummy2 = 0.0;
+        bvn::run_block_bvn_pipeline(demand_matrix, warm_cfg, stats, dummy1, dummy2);
+    } else if (cfg.mode != bvn::ExecMode::SEQ) {
         #pragma omp parallel num_threads(cfg.num_threads)
         {
             bvn::get_thread_workspace().ensure_capacity(
@@ -118,35 +136,48 @@ int main(int argc, char** argv) {
         );
     }
 
-    // 1. Phase 1: Regularization (Padding)
-    double t0 = omp_get_wtime();
-    std::vector<int> reg_matrix = bvn::regularize_matrix(
-        demand_matrix,
-        cfg.n,
-        cfg.target_degree,
-        cfg.mode,
-        stats.regularized_degree,
-        stats.total_phantom_packets
-    );
-    double t1 = omp_get_wtime();
+    std::vector<bvn::ScheduleLeaf> schedules;
+    if (cfg.mode == bvn::ExecMode::OMP_BLOCK) {
+        schedules = bvn::run_block_bvn_pipeline(
+            demand_matrix,
+            cfg,
+            stats,
+            stats.phase1_padding_ms,
+            stats.phase2_3_euler_ms
+        );
+    } else {
+        // 1. Phase 1: Regularization (Padding)
+        double t0 = omp_get_wtime();
+        std::vector<int> reg_matrix = bvn::regularize_matrix(
+            demand_matrix,
+            cfg.n,
+            cfg.target_degree,
+            cfg.mode,
+            stats.regularized_degree,
+            stats.total_phantom_packets
+        );
+        double t1 = omp_get_wtime();
 
-    // 2 & 3. Phases 2 & 3: Eulerian Divide-and-Conquer & Degree-1 Leaf Extraction
-    std::vector<bvn::ScheduleLeaf> schedules = bvn::decompose_bvn(
-        reg_matrix,
-        cfg.n,
-        stats.regularized_degree,
-        cfg
-    );
-    double t2 = omp_get_wtime();
+        // 2 & 3. Phases 2 & 3: Eulerian Divide-and-Conquer & Degree-1 Leaf Extraction
+        schedules = bvn::decompose_bvn(
+            reg_matrix,
+            cfg.n,
+            stats.regularized_degree,
+            cfg
+        );
+        double t2 = omp_get_wtime();
+
+        stats.phase1_padding_ms = (t1 - t0) * 1000.0;
+        stats.phase2_3_euler_ms = (t2 - t1) * 1000.0;
+    }
 
     // 4. Phase 4: Cleanup & Post-Processing
+    double t2_end = omp_get_wtime();
     bvn::cleanup_phantom_traffic(demand_matrix, cfg.n, cfg.mode, schedules);
     double t3 = omp_get_wtime();
 
-    stats.phase1_padding_ms = (t1 - t0) * 1000.0;
-    stats.phase2_3_euler_ms = (t2 - t1) * 1000.0;
-    stats.phase4_cleanup_ms = (t3 - t2) * 1000.0;
-    stats.total_ms = (t3 - t0) * 1000.0;
+    stats.phase4_cleanup_ms = (t3 - t2_end) * 1000.0;
+    stats.total_ms = stats.phase1_padding_ms + stats.phase2_3_euler_ms + stats.phase4_cleanup_ms;
     stats.num_schedules = static_cast<int>(schedules.size());
 
     if (cfg.verify) {
@@ -174,8 +205,13 @@ int main(int argc, char** argv) {
                   << "============================================================\n"
                   << " Mode             : " << mode_to_str(cfg.mode) << "\n"
                   << " Traffic Pattern  : " << pattern_to_str(cfg.pattern) << "\n"
-                  << " Matrix Size (N)  : " << cfg.n << " x " << cfg.n << "\n"
-                  << " Regular Degree D : " << stats.regularized_degree << "\n"
+                  << " Matrix Size (N)  : " << cfg.n << " x " << cfg.n << "\n";
+        if (cfg.mode == bvn::ExecMode::OMP_BLOCK) {
+            int K = bvn::select_optimal_block_factor(cfg.n, cfg.num_threads, cfg.block_factor);
+            std::cout << " Spatial Grid KxK : " << K << " x " << K
+                      << " (" << (K * K) << " sub-matrices of " << (cfg.n / K) << "x" << (cfg.n / K) << ")\n";
+        }
+        std::cout << " Regular Degree D : " << stats.regularized_degree << "\n"
                   << " OpenMP Threads   : " << cfg.num_threads << "\n"
                   << " Task Cut-off Deg : " << cfg.cutoff_degree << "\n"
                   << " Real Packets     : " << stats.total_real_packets << "\n"

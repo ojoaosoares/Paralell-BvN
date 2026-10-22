@@ -29,7 +29,7 @@ std::vector<int> regularize_matrix(
 
     int max_line_sum = target_degree;
 
-    if (mode == ExecMode::SEQ || (mode == ExecMode::OMP_ARCH && n <= 1024)) {
+    if (mode == ExecMode::SEQ || ((mode == ExecMode::OMP_ARCH || mode == ExecMode::OMP_BLOCK) && n <= 1024)) {
         int* col_ptr = col_sum.data();
         for (int u = 0; u < n; ++u) {
             int rsum = 0;

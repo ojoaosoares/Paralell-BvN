@@ -19,7 +19,8 @@ struct EulerWorkspace {
     std::vector<uint64_t> adj_R;      // Level-1 Bitmask adjacency for Right vertices (N * num_words)
     std::vector<uint64_t> summary_L;  // Level-0 Summary Bitmask of non-zero words for Left vertices (size N)
     std::vector<uint64_t> summary_R;  // Level-0 Summary Bitmask of non-zero words for Right vertices (size N)
-    std::vector<uint64_t> red_mask;   // Bitmask of odd edges colored Red (N * num_words)
+    std::vector<uint64_t> red_mask;   // Used by root-level parallel split (N * num_words)
+    std::vector<WeightedEdge> heavy_odd_edges; // Odd edges with w >= 3 (typically < 1% of edges)
     std::vector<WeightedEdge> level_red[kMaxRecursionDepth];
     std::vector<WeightedEdge> level_blue[kMaxRecursionDepth];
 
@@ -32,6 +33,9 @@ struct EulerWorkspace {
         if (summary_L.size() < static_cast<size_t>(n)) summary_L.assign(n, 0ULL);
         if (summary_R.size() < static_cast<size_t>(n)) summary_R.assign(n, 0ULL);
         if (red_mask.size() < mask_size) red_mask.assign(mask_size, 0ULL);
+        if (heavy_odd_edges.capacity() < static_cast<size_t>(n * 4)) {
+            heavy_odd_edges.reserve(static_cast<size_t>(n * 4));
+        }
 
         int d = 0;
         for (int cur_deg = max_level_deg; cur_deg > 1 && d < kMaxRecursionDepth; cur_deg >>= 1, ++d) {
@@ -110,6 +114,26 @@ std::vector<ScheduleLeaf> decompose_bvn(
     int n,
     int degree,
     const Config& cfg
+);
+
+/**
+ * Dynamically selects the optimal spatial block factor K (splitting N x N into K x K sub-matrices
+ * of dimension N_b = N / K) based on switch port count N, OpenMP thread count, and L1d cache size.
+ */
+int select_optimal_block_factor(int n, int num_threads, int requested_k = 0);
+
+/**
+ * Executes the Spatial Block-Diagonal BvN Pipeline (OMP_BLOCK):
+ * 1. Phase 1: Parallel sub-matrix extraction (N_b x N_b) + independent local phantom padding per block.
+ * 2. Phase 2 & 3: Parallel L1-resident Bitmask Eulerian decomposition across K^2 sub-matrices
+ *    and Latin-square diagonal schedule fusion into global N-port permutations.
+ */
+std::vector<ScheduleLeaf> run_block_bvn_pipeline(
+    const std::vector<int>& demand_matrix,
+    const Config& cfg,
+    PipelineStats& stats,
+    double& out_phase1_ms,
+    double& out_phase2_3_ms
 );
 
 } // namespace bvn

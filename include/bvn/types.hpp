@@ -12,7 +12,8 @@ namespace bvn {
 enum class ExecMode {
     SEQ,        // Sequential baseline
     OMP_NAIVE,  // Naive OpenMP: unaligned cursors (false sharing), unit-edge expansion, no task cutoff
-    OMP_ARCH    // Architecture-Aware OpenMP: alignas(64) cursors, parity pre-halving, Flat CSR, task cutoff
+    OMP_ARCH,   // Architecture-Aware OpenMP: 2-level bitmask, double TZCNT/BLSR, task cutoff
+    OMP_BLOCK   // Dynamic Spatial Block-Diagonal Decomposition (K x K sub-matrices in L1 cache)
 };
 
 /**
@@ -73,6 +74,7 @@ struct Config {
     int target_degree = 256;                      // Regularized degree D (power of 2)
     int num_threads = 4;                          // OpenMP thread count
     int cutoff_degree = 8;                        // Task cut-off degree D_min for OMP_ARCH
+    int block_factor = 0;                         // Spatial grid KxK blocks (0 = dynamic optimal selection)
     uint64_t seed = 42;                           // RNG seed for reproducibility
     ExecMode mode = ExecMode::OMP_ARCH;           // Execution mode
     TrafficPattern pattern = TrafficPattern::UNIFORM;

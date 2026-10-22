@@ -19,78 +19,146 @@ bool euler_split_sequential_ws(
     uint64_t* __restrict summary_L = ws.summary_L.data();
     uint64_t* __restrict summary_R = ws.summary_R.data();
 
+    out_red.clear();
+    out_blue.clear();
+    auto& heavy_odd = ws.heavy_odd_edges;
+    heavy_odd.clear();
+
     int E = 0;
     for (const auto& e : edges) {
+        int half = e.w >> 1;
         if (e.w & 1) {
             int uw = e.v >> 6;
             int vw = e.u >> 6;
-            adj_L[e.u * W + uw] |= (1ULL << (e.v & 63));
+            uint64_t v_bit = 1ULL << (e.v & 63);
+            adj_L[e.u * W + uw] |= v_bit;
             adj_R[e.v * W + vw] |= (1ULL << (e.u & 63));
             summary_L[e.u] |= (1ULL << uw);
             summary_R[e.v] |= (1ULL << vw);
+            if (half > 0) {
+                red_mask[e.u * W + uw] |= v_bit; // Marks that (u, v) is a heavy odd edge (w >= 3)
+                heavy_odd.push_back({e.u, e.v, half});
+            }
             ++E;
+        } else if (half > 0) {
+            out_red.push_back({e.u, e.v, half});
+            out_blue.push_back({e.u, e.v, half});
         }
     }
 
     // Symmetry Pruning: when E == 0, all weights are even so Red and Blue subtrees are 100% identical!
     if (E == 0) {
-        out_red.clear();
-        for (const auto& e : edges) {
-            int half = e.w >> 1;
-            if (half > 0) out_red.push_back({e.u, e.v, half});
-        }
         return true;
     }
 
-    // 2-Level Hierarchical Bitmask Eulerian cycle walk using double TZCNT (__builtin_ctzll) and BLSR
+    // Fast path when all odd edges have w == 1 (heavy_odd is empty):
+    // Emit {u, v, 1} directly to out_red and {next_u, v, 1} directly to out_blue during the walk!
+    // Zero red_mask accesses, zero second pass over edges!
+    if (heavy_odd.empty()) {
+        for (int root = 0; root < n; ++root) {
+            while (summary_L[root] != 0ULL) {
+                int u = root;
+                while (summary_L[u] != 0ULL) {
+                    uint64_t sum_u = summary_L[u];
+                    int uw = __builtin_ctzll(sum_u);
+                    uint64_t lmask = adj_L[u * W + uw];
+                    int v_bit = __builtin_ctzll(lmask);
+                    int v = (uw << 6) + v_bit;
+
+                    uint64_t new_lmask = lmask & (lmask - 1ULL);
+                    adj_L[u * W + uw] = new_lmask;
+                    if (new_lmask == 0ULL) {
+                        summary_L[u] = sum_u & (sum_u - 1ULL);
+                    }
+
+                    int u_word = u >> 6;
+                    uint64_t new_rmask_u = adj_R[v * W + u_word] & ~(1ULL << (u & 63));
+                    adj_R[v * W + u_word] = new_rmask_u;
+                    if (new_rmask_u == 0ULL) {
+                        summary_R[v] &= ~(1ULL << u_word);
+                    }
+                    out_red.push_back({static_cast<uint16_t>(u), static_cast<uint16_t>(v), 1});
+
+                    uint64_t sum_v = summary_R[v];
+                    int vw = __builtin_ctzll(sum_v);
+                    uint64_t rmask = adj_R[v * W + vw];
+                    int u_bit = __builtin_ctzll(rmask);
+                    int next_u = (vw << 6) + u_bit;
+
+                    uint64_t new_rmask = rmask & (rmask - 1ULL);
+                    adj_R[v * W + vw] = new_rmask;
+                    if (new_rmask == 0ULL) {
+                        summary_R[v] = sum_v & (sum_v - 1ULL);
+                    }
+
+                    int v_word = v >> 6;
+                    uint64_t new_lmask_next = adj_L[next_u * W + v_word] & ~(1ULL << (v & 63));
+                    adj_L[next_u * W + v_word] = new_lmask_next;
+                    if (new_lmask_next == 0ULL) {
+                        summary_L[next_u] &= ~(1ULL << v_word);
+                    }
+                    out_blue.push_back({static_cast<uint16_t>(next_u), static_cast<uint16_t>(v), 1});
+
+                    u = next_u;
+                    if (u == root) break;
+                }
+            }
+        }
+        return false;
+    }
+
+    // General path when some odd edges have w >= 3:
+    // Still emits all w == 1 odd edges directly during the walk, and only touches heavy_odd at the end!
     for (int root = 0; root < n; ++root) {
         while (summary_L[root] != 0ULL) {
             int u = root;
             while (summary_L[u] != 0ULL) {
-                // Step 1: L -> R (u -> v), colored Red
                 uint64_t sum_u = summary_L[u];
                 int uw = __builtin_ctzll(sum_u);
                 uint64_t lmask = adj_L[u * W + uw];
                 int v_bit = __builtin_ctzll(lmask);
                 int v = (uw << 6) + v_bit;
 
-                // Clear (u, v) in adj_L (BLSR) and summary_L
                 uint64_t new_lmask = lmask & (lmask - 1ULL);
                 adj_L[u * W + uw] = new_lmask;
                 if (new_lmask == 0ULL) {
                     summary_L[u] = sum_u & (sum_u - 1ULL);
                 }
 
-                // Clear (u, v) in adj_R and summary_R, and mark in red_mask
                 int u_word = u >> 6;
                 uint64_t new_rmask_u = adj_R[v * W + u_word] & ~(1ULL << (u & 63));
                 adj_R[v * W + u_word] = new_rmask_u;
                 if (new_rmask_u == 0ULL) {
                     summary_R[v] &= ~(1ULL << u_word);
                 }
-                red_mask[u * W + uw] |= (1ULL << v_bit);
+                if ((red_mask[u * W + uw] & (1ULL << v_bit)) == 0ULL) {
+                    out_red.push_back({static_cast<uint16_t>(u), static_cast<uint16_t>(v), 1});
+                }
 
-                // Step 2: R -> L (v -> next_u), colored Blue
-                // Since every vertex in R has even degree, summary_R[v] != 0ULL is guaranteed!
                 uint64_t sum_v = summary_R[v];
                 int vw = __builtin_ctzll(sum_v);
                 uint64_t rmask = adj_R[v * W + vw];
                 int u_bit = __builtin_ctzll(rmask);
                 int next_u = (vw << 6) + u_bit;
 
-                // Clear (next_u, v) in adj_R (BLSR) and summary_R
                 uint64_t new_rmask = rmask & (rmask - 1ULL);
                 adj_R[v * W + vw] = new_rmask;
                 if (new_rmask == 0ULL) {
                     summary_R[v] = sum_v & (sum_v - 1ULL);
                 }
 
-                // Clear (next_u, v) in adj_L and summary_L
                 int v_word = v >> 6;
-                uint64_t new_lmask_next = adj_L[next_u * W + v_word] & ~(1ULL << (v & 63));
+                uint64_t v_mask_bit = 1ULL << (v & 63);
+                uint64_t new_lmask_next = adj_L[next_u * W + v_word] & ~v_mask_bit;
                 adj_L[next_u * W + v_word] = new_lmask_next;
                 if (new_lmask_next == 0ULL) {
                     summary_L[next_u] &= ~(1ULL << v_word);
+                }
+                uint64_t& rword_next = red_mask[next_u * W + v_word];
+                if ((rword_next & v_mask_bit) == 0ULL) {
+                    out_blue.push_back({static_cast<uint16_t>(next_u), static_cast<uint16_t>(v), 1});
+                } else {
+                    rword_next &= ~v_mask_bit; // Colored Blue: clear heavy-red bit!
                 }
 
                 u = next_u;
@@ -99,25 +167,18 @@ bool euler_split_sequential_ws(
         }
     }
 
-    out_red.clear();
-    out_blue.clear();
-
-    for (const auto& e : edges) {
-        int half = e.w >> 1;
-        int w_red = half;
-        int w_blue = half;
-        if (e.w & 1) {
-            uint64_t& rword = red_mask[e.u * W + (e.v >> 6)];
-            uint64_t bit = 1ULL << (e.v & 63);
-            if (rword & bit) {
-                ++w_red;
-                rword &= ~bit; // Leaves red_mask 100% zeroed for next call without memset!
-            } else {
-                ++w_blue;
-            }
+    // Emit only the heavy odd edges (w >= 3) — no second scan over edges!
+    for (const auto& he : heavy_odd) {
+        uint64_t& rword = red_mask[he.u * W + (he.v >> 6)];
+        uint64_t bit = 1ULL << (he.v & 63);
+        if (rword & bit) {
+            rword &= ~bit; // Colored Red, leaves red_mask 100% zeroed
+            out_red.push_back({he.u, he.v, he.w + 1});
+            out_blue.push_back({he.u, he.v, he.w});
+        } else {
+            out_red.push_back({he.u, he.v, he.w});
+            out_blue.push_back({he.u, he.v, he.w + 1});
         }
-        if (w_red > 0) out_red.push_back({e.u, e.v, w_red});
-        if (w_blue > 0) out_blue.push_back({e.u, e.v, w_blue});
     }
     return false;
 }

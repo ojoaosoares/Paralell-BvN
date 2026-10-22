@@ -1,4 +1,5 @@
 #include "bvn/decomposer.hpp"
+#include "bvn/regularizer.hpp"
 #include <algorithm>
 #include <cstdint>
 #include <omp.h>
@@ -278,7 +279,6 @@ std::vector<ScheduleLeaf> decompose_omp_arch(
         return decompose_seq(regularized_matrix, n, degree);
     }
 
-    // Persistent pool of edge buffers for internal task tree nodes (zero heap contention inside tasks)
     int eff_cutoff = std::max(cfg.cutoff_degree, 2);
     int num_internal_leaves = std::max(2, degree / eff_cutoff);
     int total_nodes = 2 * num_internal_leaves + 1;
@@ -294,17 +294,8 @@ std::vector<ScheduleLeaf> decompose_omp_arch(
     );
     int half_deg = degree >> 1;
 
-    // Pre-reserve internal task buffers in parallel across threads (NUMA first-touch & zero malloc in tasks)
-    size_t root_child_edges = std::max(red_edges.size(), blue_edges.size());
     #pragma omp parallel num_threads(cfg.num_threads)
     {
-        #pragma omp for schedule(static)
-        for (int id = 3; id < total_nodes; ++id) {
-            if (node_buffers[id].capacity() < root_child_edges) {
-                node_buffers[id].reserve(root_child_edges);
-            }
-        }
-
         if (root_symmetric) {
             #pragma omp single
             {
@@ -334,6 +325,247 @@ std::vector<ScheduleLeaf> decompose_omp_arch(
     }
 
     return leaves;
+}
+
+namespace {
+
+int next_pow2_int(int x) {
+    int p = 1;
+    while (p < x) {
+        p <<= 1;
+    }
+    return p;
+}
+
+} // namespace
+
+int select_optimal_block_factor(int n, int num_threads, int requested_k) {
+    if (requested_k > 0 && (n % requested_k == 0)) {
+        return requested_k;
+    }
+
+    // Dynamic architectural heuristic:
+    // 1. Target sub-matrix dimension N_b in [64, 256] so that 2 * N_b * (N_b / 64) * 8B fits in 32KB L1d cache.
+    // 2. Ensure K * K >= num_threads so 100% of OpenMP threads have independent sub-matrices at Depth 0.
+    // 3. Avoid N_b < 64 to keep diagonal schedule fusion overhead negligible.
+    int k = 1;
+    while ((k * k < num_threads || (n / k) > 256) && (n / (k * 2)) >= 64 && (n % (k * 2) == 0)) {
+        k <<= 1;
+    }
+    if (k == 1 && n >= 128 && (n % 2 == 0) && num_threads > 1) {
+        k = 2;
+    }
+    return k;
+}
+
+std::vector<ScheduleLeaf> run_block_bvn_pipeline(
+    const std::vector<int>& demand_matrix,
+    const Config& cfg,
+    PipelineStats& stats,
+    double& out_phase1_ms,
+    double& out_phase2_3_ms
+) {
+    const int n = cfg.n;
+    const int K = select_optimal_block_factor(n, cfg.num_threads, cfg.block_factor);
+    const int nb = n / K;
+    const int num_blocks = K * K;
+
+    double t0 = omp_get_wtime();
+
+    static std::vector<std::vector<WeightedEdge>> block_edges;
+    static std::vector<std::vector<ScheduleLeaf>> block_leaves;
+    if (static_cast<int>(block_edges.size()) < num_blocks) {
+        block_edges.resize(num_blocks);
+    }
+    if (static_cast<int>(block_leaves.size()) < num_blocks) {
+        block_leaves.resize(num_blocks);
+    }
+
+    // Warm-up call (target_degree == 0) only pre-touches thread-local and static buffers
+    if (cfg.target_degree <= 0) {
+        #pragma omp parallel num_threads(cfg.num_threads)
+        {
+            #pragma omp for schedule(static)
+            for (int b_idx = 0; b_idx < num_blocks; ++b_idx) {
+                block_edges[b_idx].reserve(static_cast<size_t>(nb) * nb);
+                block_leaves[b_idx].resize(n / K);
+                for (auto& lf : block_leaves[b_idx]) {
+                    lf.perm.assign(nb, -1);
+                }
+            }
+        }
+        out_phase1_ms = 0.0;
+        out_phase2_3_ms = 0.0;
+        return {};
+    }
+
+    std::vector<int> block_deg(num_blocks, 0);
+    std::vector<int> shift_deg(K, 0);
+    int64_t total_phantom = 0;
+
+    // Phase 1: Single-pass parallel sub-matrix extraction + local phantom padding
+    #pragma omp parallel num_threads(cfg.num_threads) reduction(+:total_phantom)
+    {
+        static thread_local std::vector<int> sub_mat;
+        static thread_local std::vector<int> row_sum;
+        static thread_local std::vector<int> col_sum;
+        if (static_cast<int>(sub_mat.size()) < nb * nb) sub_mat.resize(static_cast<size_t>(nb) * nb);
+        if (static_cast<int>(row_sum.size()) < nb) row_sum.resize(nb);
+        if (static_cast<int>(col_sum.size()) < nb) col_sum.resize(nb);
+
+        int* __restrict sub_ptr = sub_mat.data();
+        int* __restrict r_ptr = row_sum.data();
+        int* __restrict c_ptr = col_sum.data();
+
+        #pragma omp for schedule(dynamic, 1)
+        for (int b_idx = 0; b_idx < num_blocks; ++b_idx) {
+            const int s = b_idx / K;
+            const int bi = b_idx % K;
+            const int bj = (bi + s) % K;
+            const int row_base = bi * nb;
+            const int col_base = bj * nb;
+
+            std::fill(c_ptr, c_ptr + nb, 0);
+            int max_line = 0;
+
+            for (int u = 0; u < nb; ++u) {
+                const int* __restrict src_row = &demand_matrix[static_cast<size_t>(row_base + u) * n + col_base];
+                int* __restrict dst_row = &sub_ptr[static_cast<size_t>(u) * nb];
+                int rsum = 0;
+                #pragma omp simd reduction(+:rsum)
+                for (int v = 0; v < nb; ++v) {
+                    int w = src_row[v];
+                    dst_row[v] = w;
+                    rsum += w;
+                    c_ptr[v] += w;
+                }
+                r_ptr[u] = rsum;
+                if (rsum > max_line) max_line = rsum;
+            }
+            for (int v = 0; v < nb; ++v) {
+                if (c_ptr[v] > max_line) max_line = c_ptr[v];
+            }
+
+            auto& edges = block_edges[b_idx];
+            edges.clear();
+            if (max_line == 0) {
+                block_deg[b_idx] = 0;
+                continue;
+            }
+
+            const int db = next_pow2_int(max_line);
+            block_deg[b_idx] = db;
+
+            // Local two-pointer O(N_b) greedy deficit matching (phantom padding inside the N_b x N_b block)
+            int u = 0;
+            int v = 0;
+            while (u < nb && v < nb) {
+                int r_def = db - r_ptr[u];
+                int c_def = db - c_ptr[v];
+                if (r_def == 0) {
+                    ++u;
+                    continue;
+                }
+                if (c_def == 0) {
+                    ++v;
+                    continue;
+                }
+                int add = std::min(r_def, c_def);
+                sub_ptr[static_cast<size_t>(u) * nb + v] += add;
+                r_ptr[u] += add;
+                c_ptr[v] += add;
+                total_phantom += add;
+            }
+
+            for (int r = 0; r < nb; ++r) {
+                const int* __restrict dst_row = &sub_ptr[static_cast<size_t>(r) * nb];
+                for (int c = 0; c < nb; ++c) {
+                    if (dst_row[c] > 0) {
+                        edges.push_back({r, c, dst_row[c]});
+                    }
+                }
+            }
+        }
+    }
+
+    int total_schedules = 0;
+    std::vector<int> shift_offset(K + 1, 0);
+    for (int s = 0; s < K; ++s) {
+        int d_max = 0;
+        for (int bi = 0; bi < K; ++bi) {
+            d_max = std::max(d_max, block_deg[s * K + bi]);
+        }
+        shift_deg[s] = d_max;
+        shift_offset[s + 1] = shift_offset[s] + d_max;
+        total_schedules += d_max;
+    }
+
+    stats.regularized_degree = total_schedules;
+    stats.total_phantom_packets = total_phantom;
+
+    double t1 = omp_get_wtime();
+
+    // Phase 2 & 3: Embarrassingly parallel L1-resident Bitmask Eulerian BvN on all K^2 blocks
+    // followed by conflict-free diagonal block fusion into global N-port ScheduleLeaf permutations
+    for (int b_idx = 0; b_idx < num_blocks; ++b_idx) {
+        if (static_cast<int>(block_leaves[b_idx].size()) < block_deg[b_idx]) {
+            block_leaves[b_idx].resize(block_deg[b_idx]);
+        }
+    }
+
+    std::vector<ScheduleLeaf> global_leaves(total_schedules);
+
+    #pragma omp parallel num_threads(cfg.num_threads)
+    {
+        EulerWorkspace& tls_ws = get_thread_workspace();
+
+        // Step A: Decompose each non-empty N_b x N_b block independently in L1 cache
+        #pragma omp for schedule(dynamic, 1)
+        for (int b_idx = 0; b_idx < num_blocks; ++b_idx) {
+            int db = block_deg[b_idx];
+            if (db == 0) continue;
+            const auto& edges = block_edges[b_idx];
+            tls_ws.ensure_capacity(nb, db, db, static_cast<int>(edges.size()));
+            decompose_recursive_seq_ws(edges, nb, db, 0, 0, tls_ws, block_leaves[b_idx]);
+        }
+
+        // Step B: Parallel fusion across all total_schedules leaves (100% thread utilization)
+        #pragma omp for schedule(static)
+        for (int s = 0; s < K; ++s) {
+            int d_max = shift_deg[s];
+            int base_idx = shift_offset[s];
+            for (int d = 0; d < d_max; ++d) {
+                ScheduleLeaf& g_leaf = global_leaves[base_idx + d];
+                g_leaf.weight = 1;
+                g_leaf.perm.resize(n);
+                int* __restrict g_perm = g_leaf.perm.data();
+
+                for (int bi = 0; bi < K; ++bi) {
+                    const int b_idx = s * K + bi;
+                    const int db = block_deg[b_idx];
+                    const int bj = (bi + s) % K;
+                    const int row_base = bi * nb;
+                    const int col_base = bj * nb;
+
+                    if (d < db) {
+                        const int* __restrict b_perm = block_leaves[b_idx][d].perm.data();
+                        for (int u = 0; u < nb; ++u) {
+                            int local_v = b_perm[u];
+                            g_perm[row_base + u] = (local_v >= 0) ? (col_base + local_v) : -1;
+                        }
+                    } else {
+                        std::fill(g_perm + row_base, g_perm + row_base + nb, -1);
+                    }
+                }
+            }
+        }
+    }
+
+    double t2 = omp_get_wtime();
+    out_phase1_ms = (t1 - t0) * 1000.0;
+    out_phase2_3_ms = (t2 - t1) * 1000.0;
+
+    return global_leaves;
 }
 
 } // namespace bvn
