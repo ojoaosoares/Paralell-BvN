@@ -1,4 +1,7 @@
-#include "bvn/pipeline.hpp"
+#include "bvn/decomposer.hpp"
+#include "bvn/postprocessor.hpp"
+#include "bvn/regularizer.hpp"
+#include "bvn/traffic.hpp"
 #include "bvn/types.hpp"
 
 #include <cstdlib>
@@ -111,7 +114,7 @@ int main(int argc, char** argv) {
 
     // 1. Phase 1: Regularization (Padding)
     double t0 = omp_get_wtime();
-    std::vector<int> reg_matrix = bvn::phase1_regularize(
+    std::vector<int> reg_matrix = bvn::regularize_matrix(
         demand_matrix,
         cfg.n,
         cfg.target_degree,
@@ -122,7 +125,7 @@ int main(int argc, char** argv) {
     double t1 = omp_get_wtime();
 
     // 2 & 3. Phases 2 & 3: Eulerian Divide-and-Conquer & Degree-1 Leaf Extraction
-    std::vector<bvn::ScheduleLeaf> schedules = bvn::phase2_3_euler_decompose(
+    std::vector<bvn::ScheduleLeaf> schedules = bvn::decompose_bvn(
         reg_matrix,
         cfg.n,
         stats.regularized_degree,
@@ -131,7 +134,7 @@ int main(int argc, char** argv) {
     double t2 = omp_get_wtime();
 
     // 4. Phase 4: Cleanup & Post-Processing
-    bvn::phase4_cleanup_phantom(demand_matrix, cfg.n, cfg.mode, schedules);
+    bvn::cleanup_phantom_traffic(demand_matrix, cfg.n, cfg.mode, schedules);
     double t3 = omp_get_wtime();
 
     stats.phase1_padding_ms = (t1 - t0) * 1000.0;
@@ -147,7 +150,6 @@ int main(int argc, char** argv) {
     }
 
     if (cfg.csv_output) {
-        // CSV format: mode,pattern,N,D,threads,cutoff,phase1_ms,phase2_3_ms,phase4_ms,total_ms,verified
         std::cout << mode_to_str(cfg.mode) << ","
                   << pattern_to_str(cfg.pattern) << ","
                   << cfg.n << ","

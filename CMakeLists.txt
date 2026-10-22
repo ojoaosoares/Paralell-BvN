@@ -13,10 +13,13 @@ find_package(OpenMP REQUIRED)
 
 add_executable(bvn_bench
     src/main.cpp
-    src/traffic_gen.cpp
-    src/phase1_padding.cpp
-    src/phase2_3_euler_bvn.cpp
-    src/phase4_cleanup.cpp
+    src/traffic.cpp
+    src/regularizer.cpp
+    src/euler_trail.cpp
+    src/decomposer_seq.cpp
+    src/decomposer_naive.cpp
+    src/decomposer_arch.cpp
+    src/postprocessor.cpp
 )
 
 target_include_directories(bvn_bench PRIVATE include)

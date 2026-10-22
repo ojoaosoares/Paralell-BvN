@@ -1,10 +1,11 @@
-#include "bvn/pipeline.hpp"
+#include "bvn/postprocessor.hpp"
+#include <algorithm>
 #include <omp.h>
 #include <vector>
 
 namespace bvn {
 
-void phase4_cleanup_phantom(
+void cleanup_phantom_traffic(
     const std::vector<int>& original_demand_matrix,
     int n,
     ExecMode mode,
@@ -73,11 +74,10 @@ bool verify_decomposition(
 
         for (int u = 0; u < n; ++u) {
             int v = leaf.perm[u];
-            if (v == -1) continue; // Idle port (no-op)
+            if (v == -1) continue;
             if (v < 0 || v >= n) {
                 return false;
             }
-            // Verify zero output port contention in this permutation matrix
             if (output_used[v] != 0) {
                 return false;
             }
@@ -86,7 +86,6 @@ bool verify_decomposition(
         }
     }
 
-    // Verify exact match with original chaotic traffic matrix M
     for (size_t i = 0; i < reconstructed.size(); ++i) {
         if (reconstructed[i] != original_demand_matrix[i]) {
             return false;

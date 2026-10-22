@@ -1,4 +1,4 @@
-#include "bvn/pipeline.hpp"
+#include "bvn/regularizer.hpp"
 #include <algorithm>
 #include <omp.h>
 #include <vector>
@@ -15,7 +15,7 @@ int next_power_of_two(int x) {
 }
 } // namespace
 
-std::vector<int> phase1_regularize(
+std::vector<int> regularize_matrix(
     const std::vector<int>& demand_matrix,
     int n,
     int target_degree,
@@ -47,7 +47,7 @@ std::vector<int> phase1_regularize(
             if (col_sum[v] > max_line_sum) max_line_sum = col_sum[v];
         }
     } else {
-        // Multi-threaded row-major SIMD accumulation for large N (or OMP_NAIVE)
+        // Multi-threaded row-major SIMD accumulation (eliminates strided column cache thrashing)
         #pragma omp parallel reduction(max:max_line_sum)
         {
             std::vector<int> local_col(n, 0);

@@ -1,4 +1,4 @@
-#include "bvn/pipeline.hpp"
+#include "bvn/traffic.hpp"
 #include <algorithm>
 #include <random>
 #include <vector>
@@ -14,8 +14,8 @@ std::vector<int> generate_traffic_matrix(const Config& cfg, int64_t& out_total_p
 
     std::mt19937_64 rng(cfg.seed);
 
-    // Target utilization ~75% to 90% of D so that Phase 1 (Padding) and Phase 4 (Cleanup)
-    // actively insert and strip non-trivial amounts of phantom traffic.
+    // Target utilization ~82% of D so Regularization and Post-Processing
+    // actively insert and filter non-trivial amounts of phantom traffic.
     const int target_load = std::max(1, (D * 82) / 100);
 
     std::vector<int> perm(n);
@@ -27,7 +27,6 @@ std::vector<int> generate_traffic_matrix(const Config& cfg, int64_t& out_total_p
         for (int s = 0; s < target_load; ++s) {
             std::shuffle(perm.begin(), perm.end(), rng);
             for (int u = 0; u < n; ++u) {
-                // Drop ~10% randomly to create uneven row/col sums (chaotic traffic)
                 if ((rng() % 10) != 0) {
                     int v = perm[u];
                     mat[static_cast<size_t>(u) * n + v] += 1;
@@ -38,7 +37,6 @@ std::vector<int> generate_traffic_matrix(const Config& cfg, int64_t& out_total_p
             }
         }
     } else if (cfg.pattern == TrafficPattern::SKEWED) {
-        // Skewed hotspot traffic: heavy weight on diagonal and near-diagonal neighbors
         for (int u = 0; u < n; ++u) {
             for (int k = 0; k < 4; ++k) {
                 int v = (u + k) % n;
@@ -52,7 +50,6 @@ std::vector<int> generate_traffic_matrix(const Config& cfg, int64_t& out_total_p
             }
         }
     } else {
-        // BURSTY: sparse high-intensity flows between random input-output pairs
         int bursts = n * 8;
         std::uniform_int_distribution<int> dist_port(0, n - 1);
         for (int b = 0; b < bursts; ++b) {
