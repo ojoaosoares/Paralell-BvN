@@ -520,13 +520,44 @@ std::vector<ScheduleLeaf> run_block_bvn_pipeline(
         EulerWorkspace& tls_ws = get_thread_workspace();
 
         // Step A: Decompose each non-empty N_b x N_b block independently in L1 cache
+        // and immediately filter out local phantom padding while the N_b x N_b sub-matrix is hot in L1/L2!
         #pragma omp for schedule(dynamic, 1)
         for (int b_idx = 0; b_idx < num_blocks; ++b_idx) {
             int db = block_deg[b_idx];
             if (db == 0) continue;
             const auto& edges = block_edges[b_idx];
             tls_ws.ensure_capacity(nb, db, db, static_cast<int>(edges.size()));
-            decompose_recursive_seq_ws(edges, nb, db, 0, 0, tls_ws, block_leaves[b_idx]);
+            auto& b_leaves = block_leaves[b_idx];
+            decompose_recursive_seq_ws(edges, nb, db, 0, 0, tls_ws, b_leaves);
+
+            // Local L1-resident phantom traffic cleanup for block b_idx:
+            // Compare only against the real demand of this N_b x N_b block (only db leaves instead of sum of K shifts!)
+            const int s = b_idx / K;
+            const int bi = b_idx % K;
+            const int bj = (bi + s) % K;
+            const int row_base = bi * nb;
+            const int col_base = bj * nb;
+
+            static thread_local std::vector<int> rem_row;
+            if (static_cast<int>(rem_row.size()) < nb) rem_row.resize(nb);
+            int* __restrict rem_ptr = rem_row.data();
+
+            for (int u = 0; u < nb; ++u) {
+                const int* __restrict orig_row = &demand_matrix[static_cast<size_t>(row_base + u) * n + col_base];
+                for (int v = 0; v < nb; ++v) {
+                    rem_ptr[v] = orig_row[v];
+                }
+                for (int d = 0; d < db; ++d) {
+                    int v = b_leaves[d].perm[u];
+                    if (v >= 0) {
+                        if (rem_ptr[v] > 0) {
+                            rem_ptr[v]--;
+                        } else {
+                            b_leaves[d].perm[u] = -1; // Filtered locally in L1 cache!
+                        }
+                    }
+                }
+            }
         }
 
         // Step B: Parallel fusion across all total_schedules leaves (100% thread utilization)

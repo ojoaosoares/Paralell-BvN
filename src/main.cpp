@@ -171,9 +171,11 @@ int main(int argc, char** argv) {
         stats.phase2_3_euler_ms = (t2 - t1) * 1000.0;
     }
 
-    // 4. Phase 4: Cleanup & Post-Processing
+    // 4. Phase 4: Cleanup & Post-Processing (for OMP_BLOCK, phantom cleanup was already fused in L1 per sub-matrix!)
     double t2_end = omp_get_wtime();
-    bvn::cleanup_phantom_traffic(demand_matrix, cfg.n, cfg.mode, schedules);
+    if (cfg.mode != bvn::ExecMode::OMP_BLOCK) {
+        bvn::cleanup_phantom_traffic(demand_matrix, cfg.n, cfg.mode, schedules);
+    }
     double t3 = omp_get_wtime();
 
     stats.phase4_cleanup_ms = (t3 - t2_end) * 1000.0;
