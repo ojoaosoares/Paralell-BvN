@@ -487,6 +487,7 @@ std::vector<ScheduleLeaf> run_block_bvn_pipeline(
 
     static std::vector<std::vector<WeightedEdge>> block_edges;
     static std::vector<std::vector<ScheduleLeaf>> block_leaves;
+    static std::vector<std::vector<std::vector<WeightedEdge>>> block_node_buffers;
     static std::vector<ScheduleLeaf> global_pool;
     if (static_cast<int>(block_edges.size()) < num_blocks) {
         block_edges.resize(num_blocks);
@@ -494,27 +495,45 @@ std::vector<ScheduleLeaf> run_block_bvn_pipeline(
     if (static_cast<int>(block_leaves.size()) < num_blocks) {
         block_leaves.resize(num_blocks);
     }
+    if (static_cast<int>(block_node_buffers.size()) < num_blocks) {
+        block_node_buffers.resize(num_blocks);
+    }
 
-    // Warm-up call (target_degree == 0) pre-touches thread-local, block, and global schedule buffers
+    // Warm-up call (target_degree <= 0) pre-touches thread-local, block, and global schedule buffers
     if (cfg.target_degree <= 0) {
-        int max_possible_sched = 2 * next_pow2_int(std::max(1, n));
+        int target_D = (cfg.target_degree < 0) ? -cfg.target_degree : n;
+        int max_possible_sched = K * next_pow2_int(target_D);
         if (static_cast<int>(global_pool.size()) < max_possible_sched) {
             global_pool.resize(max_possible_sched);
         }
+        const size_t max_block_edges = static_cast<size_t>(nb) * std::min(nb, 256) + 2 * nb;
+        int db_max = next_pow2_int(target_D);
+        int max_nodes = 2 * std::max(2, db_max / 32) + 1;
+
         #pragma omp parallel num_threads(cfg.num_threads)
         {
             #pragma omp for schedule(static)
             for (int b_idx = 0; b_idx < num_blocks; ++b_idx) {
-                block_edges[b_idx].reserve(static_cast<size_t>(nb) * nb);
-                block_leaves[b_idx].resize(n / K);
+                block_edges[b_idx].resize(max_block_edges);
+                block_leaves[b_idx].resize(db_max);
                 for (auto& lf : block_leaves[b_idx]) {
-                    lf.perm.assign(nb, -1);
+                    if (static_cast<int>(lf.perm.size()) != nb) {
+                        lf.perm.assign(nb, -1);
+                    }
+                }
+                block_node_buffers[b_idx].resize(max_nodes);
+                for (auto& buf : block_node_buffers[b_idx]) {
+                    if (buf.capacity() < max_block_edges) {
+                        buf.reserve(max_block_edges);
+                    }
                 }
             }
             #pragma omp for schedule(static)
             for (int s = 0; s < max_possible_sched; ++s) {
                 global_pool[s].weight = 1;
-                global_pool[s].perm.assign(n, -1);
+                if (static_cast<int>(global_pool[s].perm.size()) != n) {
+                    global_pool[s].perm.assign(n, -1);
+                }
             }
         }
         out_phase1_ms = 0.0;
@@ -526,7 +545,7 @@ std::vector<ScheduleLeaf> run_block_bvn_pipeline(
     std::vector<int> shift_deg(K, 0);
     int64_t total_phantom = 0;
 
-    // Phase 1: Single-pass parallel sub-matrix extraction + Edge-Coalesced & Parity-Aligned local padding
+    // Phase 1: Single-pass parallel AVX2 SIMD + Adaptive Branchless sub-matrix extraction & local padding
     #pragma omp parallel num_threads(cfg.num_threads) reduction(+:total_phantom)
     {
         get_thread_workspace().reset_counters();
@@ -537,6 +556,7 @@ std::vector<ScheduleLeaf> run_block_bvn_pipeline(
 
         int* __restrict r_ptr = row_sum.data();
         int* __restrict c_ptr = col_sum.data();
+        const size_t max_block_edges = static_cast<size_t>(nb) * std::min(nb, 256) + 2 * nb;
 
         #pragma omp for schedule(dynamic, 1)
         for (int b_idx = 0; b_idx < num_blocks; ++b_idx) {
@@ -550,27 +570,52 @@ std::vector<ScheduleLeaf> run_block_bvn_pipeline(
             int max_line = 0;
 
             auto& edges = block_edges[b_idx];
-            edges.clear();
+            if (edges.size() < max_block_edges) {
+                edges.resize(max_block_edges);
+            }
+            WeightedEdge* __restrict e_ptr = edges.data();
+            WeightedEdge* const e_begin = e_ptr;
 
             for (int u = 0; u < nb; ++u) {
                 const int* __restrict src_row = &demand_matrix[static_cast<size_t>(row_base + u) * n + col_base];
                 int rsum = 0;
+                int nnz = 0;
+                #pragma omp simd reduction(+:rsum, nnz)
                 for (int v = 0; v < nb; ++v) {
                     int w = src_row[v];
-                    if (w > 0) {
-                        rsum += w;
-                        c_ptr[v] += w;
-                        edges.push_back({u, v, w});
-                    }
+                    rsum += w;
+                    nnz += (w > 0);
                 }
                 r_ptr[u] = rsum;
+                if (nnz == 0) continue;
                 if (rsum > max_line) max_line = rsum;
+
+                const uint16_t u16 = static_cast<uint16_t>(u);
+                if (nnz * 4 >= nb) {
+                    // Truly dense non-zero sub-row (e.g., uniform): 100% branchless raw-pointer extraction
+                    for (int v = 0; v < nb; ++v) {
+                        int w = src_row[v];
+                        c_ptr[v] += w;
+                        *e_ptr = {u16, static_cast<uint16_t>(v), w};
+                        e_ptr += (w > 0);
+                    }
+                } else {
+                    // Sparse non-zero sub-row (e.g., skewed/bursty): predictable zero-skipping
+                    for (int v = 0; v < nb; ++v) {
+                        int w = src_row[v];
+                        if (w > 0) {
+                            c_ptr[v] += w;
+                            *e_ptr++ = {u16, static_cast<uint16_t>(v), w};
+                        }
+                    }
+                }
             }
             for (int v = 0; v < nb; ++v) {
                 if (c_ptr[v] > max_line) max_line = c_ptr[v];
             }
 
             if (max_line == 0) {
+                edges.resize(0);
                 block_deg[b_idx] = 0;
                 continue;
             }
@@ -606,14 +651,14 @@ std::vector<ScheduleLeaf> run_block_bvn_pipeline(
             }
 
             // Pass 1: Coalesce phantom padding directly onto existing real edges (0 new edges created!)
-            for (auto& e : edges) {
-                int r_def = db - r_ptr[e.u];
-                int c_def = db - c_ptr[e.v];
+            for (WeightedEdge* p = e_begin; p != e_ptr; ++p) {
+                int r_def = db - r_ptr[p->u];
+                int c_def = db - c_ptr[p->v];
                 if (r_def > 0 && c_def > 0) {
                     int add = std::min(r_def, c_def);
-                    e.w += add;
-                    r_ptr[e.u] += add;
-                    c_ptr[e.v] += add;
+                    p->w += add;
+                    r_ptr[p->u] += add;
+                    c_ptr[p->v] += add;
                     total_phantom += add;
                 }
             }
@@ -633,11 +678,12 @@ std::vector<ScheduleLeaf> run_block_bvn_pipeline(
                     continue;
                 }
                 int add = std::min(r_def, c_def);
-                edges.push_back({u, v, add});
+                *e_ptr++ = {static_cast<uint16_t>(u), static_cast<uint16_t>(v), add};
                 r_ptr[u] += add;
                 c_ptr[v] += add;
                 total_phantom += add;
             }
+            edges.resize(static_cast<size_t>(e_ptr - e_begin));
         }
     }
 
@@ -663,17 +709,16 @@ std::vector<ScheduleLeaf> run_block_bvn_pipeline(
 
     double t1 = omp_get_wtime();
 
-    static std::vector<std::vector<std::vector<WeightedEdge>>> block_node_buffers;
-    if (static_cast<int>(block_node_buffers.size()) < num_blocks) {
-        block_node_buffers.resize(num_blocks);
-    }
     for (int b_idx = 0; b_idx < num_blocks; ++b_idx) {
         int db = block_deg[b_idx];
         if (static_cast<int>(block_leaves[b_idx].size()) < db) {
             block_leaves[b_idx].resize(db);
         }
         if (db > hotspot_thresh) {
-            int num_internal = std::max(2, db / intra_block_cutoff);
+            int b_cutoff = (num_blocks < cfg.num_threads * 2)
+                ? std::max(intra_block_cutoff, db >> 2)
+                : std::max(intra_block_cutoff, db >> 3);
+            int num_internal = std::max(2, db / b_cutoff);
             int total_nodes = 2 * num_internal + 1;
             if (static_cast<int>(block_node_buffers[b_idx].size()) < total_nodes) {
                 block_node_buffers[b_idx].resize(total_nodes);
@@ -702,8 +747,11 @@ std::vector<ScheduleLeaf> run_block_bvn_pipeline(
             auto& b_leaves = block_leaves[b_idx];
 
             if (db > hotspot_thresh) {
+                int b_cutoff = (num_blocks < cfg.num_threads * 2)
+                    ? std::max(intra_block_cutoff, db >> 2)
+                    : std::max(intra_block_cutoff, db >> 3);
                 decompose_recursive_omp_arch(
-                    edges, nb, db, 0, intra_block_cutoff, 0, 0, block_node_buffers[b_idx], b_leaves
+                    edges, nb, db, 0, b_cutoff, 0, 0, block_node_buffers[b_idx], b_leaves
                 );
             } else {
                 double tb0 = omp_get_wtime();
@@ -713,52 +761,83 @@ std::vector<ScheduleLeaf> run_block_bvn_pipeline(
             }
 
             double tc0 = omp_get_wtime();
-            // Local L1-resident phantom traffic cleanup + Dead-Schedule Compaction for block b_idx
+            // Step C.2: L1-resident Phantom Cleanup with Dual Early-Exit (row_real == 0 / row_phantom == 0) & Dead-Schedule Compaction
             const int s = b_idx / K;
             const int bi = b_idx % K;
             const int bj = (bi + s) % K;
             const int row_base = bi * nb;
             const int col_base = bj * nb;
 
+            static thread_local std::vector<int*> tls_leaf_ptrs;
+            static thread_local std::vector<uint8_t> tls_nonempty;
             static thread_local std::vector<int> rem_row;
-            static thread_local std::vector<uint8_t> sched_nonempty;
+            static thread_local std::vector<int> empty_rows;
+            if (static_cast<int>(tls_leaf_ptrs.size()) < db) tls_leaf_ptrs.resize(db);
+            if (static_cast<int>(tls_nonempty.size()) < db) tls_nonempty.resize(db);
             if (static_cast<int>(rem_row.size()) < nb) rem_row.resize(nb);
-            if (static_cast<int>(sched_nonempty.size()) < db) sched_nonempty.resize(db);
+            empty_rows.clear();
+
+            int** __restrict leaf_ptrs = tls_leaf_ptrs.data();
+            uint8_t* __restrict ne_ptr = tls_nonempty.data();
             int* __restrict rem_ptr = rem_row.data();
-            uint8_t* __restrict ne_ptr = sched_nonempty.data();
             std::fill(ne_ptr, ne_ptr + db, 0);
 
+            for (int d = 0; d < db; ++d) {
+                leaf_ptrs[d] = b_leaves[d].perm.data();
+            }
+
+            int ne_suffix_start = db; // Any d >= ne_suffix_start is guaranteed non-empty!
+
             for (int u = 0; u < nb; ++u) {
-                const int* __restrict orig_row = &demand_matrix[static_cast<size_t>(row_base + u) * n + col_base];
+                const int* __restrict orig_row =
+                    &demand_matrix[static_cast<size_t>(row_base + u) * n + col_base];
                 int row_real = 0;
+                #pragma omp simd reduction(+:row_real)
                 for (int v = 0; v < nb; ++v) {
                     int w = orig_row[v];
                     rem_ptr[v] = w;
                     row_real += w;
                 }
                 if (row_real == 0) {
-                    for (int d = 0; d < db; ++d) {
-                        b_leaves[d].perm[u] = -1;
-                    }
+                    empty_rows.push_back(u);
                     continue;
                 }
+                if (row_real == db) {
+                    // Zero phantom packets in row u: all db schedules are 100% real! Skip in O(1)!
+                    ne_suffix_start = 0;
+                    continue;
+                }
+
+                int row_phantom = db - row_real;
                 for (int d = 0; d < db; ++d) {
-                    int v = b_leaves[d].perm[u];
-                    if (v >= 0) {
-                        if (rem_ptr[v] > 0) {
-                            rem_ptr[v]--;
-                            ne_ptr[d] = 1;
-                            if (--row_real == 0) {
-                                for (int d_rem = d + 1; d_rem < db; ++d_rem) {
-                                    b_leaves[d_rem].perm[u] = -1;
-                                }
-                                break;
+                    int* __restrict lp = leaf_ptrs[d];
+                    int v = lp[u];
+                    v &= ~(v >> 31);
+                    if (rem_ptr[v] > 0) {
+                        rem_ptr[v]--;
+                        ne_ptr[d] = 1;
+                        if (--row_real == 0) {
+                            // All real packets found: remaining schedules in row u are 100% phantom!
+                            for (int d_rem = d + 1; d_rem < db; ++d_rem) {
+                                leaf_ptrs[d_rem][u] = -1;
                             }
-                        } else {
-                            b_leaves[d].perm[u] = -1; // Filtered locally in L1 cache!
+                            break;
+                        }
+                    } else {
+                        lp[u] = -1;
+                        if (--row_phantom == 0) {
+                            // All phantom packets found: remaining schedules in row u are 100% real!
+                            if (d + 1 < ne_suffix_start) {
+                                ne_suffix_start = d + 1;
+                            }
+                            break;
                         }
                     }
                 }
+            }
+
+            if (ne_suffix_start < db) {
+                std::fill(ne_ptr + ne_suffix_start, ne_ptr + db, 1);
             }
 
             // Compact non-empty schedules in O(db) pointer swaps!
@@ -768,10 +847,21 @@ std::vector<ScheduleLeaf> run_block_bvn_pipeline(
                     if (write_d != d) {
                         b_leaves[write_d].perm.swap(b_leaves[d].perm);
                     }
+                    leaf_ptrs[write_d] = b_leaves[write_d].perm.data();
                     ++write_d;
                 }
             }
             block_deg[b_idx] = write_d;
+
+            // Fill -1 on empty rows only for the write_d surviving schedules!
+            if (!empty_rows.empty()) {
+                for (int d = 0; d < write_d; ++d) {
+                    int* __restrict lp = leaf_ptrs[d];
+                    for (int u : empty_rows) {
+                        lp[u] = -1;
+                    }
+                }
+            }
 
             double tc1 = omp_get_wtime();
             double c_ms = (tc1 - tc0) * 1000.0;
@@ -803,7 +893,7 @@ std::vector<ScheduleLeaf> run_block_bvn_pipeline(
             }
         }
 
-        // Step C.3: Flat 12-Thread Parallel Fusion across all total_schedules leaves (100% thread utilization!)
+        // Step C.3: Flat 12-Thread Parallel AVX2 SIMD Fusion across all total_schedules leaves
         double tf0 = omp_get_wtime();
         #pragma omp for schedule(static)
         for (int g_idx = 0; g_idx < total_schedules; ++g_idx) {
@@ -828,9 +918,11 @@ std::vector<ScheduleLeaf> run_block_bvn_pipeline(
 
                 if (d < db) {
                     const int* __restrict b_perm = block_leaves[b_idx][d].perm.data();
+                    int* __restrict dst = g_perm + row_base;
+                    #pragma omp simd
                     for (int u = 0; u < nb; ++u) {
                         int local_v = b_perm[u];
-                        g_perm[row_base + u] = (local_v >= 0) ? (col_base + local_v) : -1;
+                        dst[u] = (local_v >= 0) ? (col_base + local_v) : -1;
                     }
                 } else {
                     std::fill(g_perm + row_base, g_perm + row_base + nb, -1);

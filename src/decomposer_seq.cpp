@@ -58,9 +58,8 @@ bool euler_split_sequential_ws(
         return true;
     }
 
-    // Fast path when all odd edges have w == 1 (heavy_odd is empty):
+    // Fast path 1: all odd edges have w == 1 (heavy_odd is empty)
     // Emit {u, v, 1} directly to out_red and {next_u, v, 1} directly to out_blue during the walk!
-    // Zero red_mask accesses, zero second pass over edges!
     if (heavy_odd.empty()) {
         ws.unit_odd_fast++;
         for (int root = 0; root < n; ++root) {
@@ -116,85 +115,136 @@ bool euler_split_sequential_ws(
     }
 
     ws.heavy_odd++;
-    // General path when some odd edges have w >= 3:
-    // Uses 256-byte L1-resident has_heavy_L bitset to bypass 512KB red_mask on >95% of vertices!
-    for (int root = 0; root < n; ++root) {
-        while (summary_L[root] != 0ULL) {
-            int u = root;
-            while (summary_L[u] != 0ULL) {
-                uint64_t sum_u = summary_L[u];
-                int uw = __builtin_ctzll(sum_u);
-                uint64_t lmask = adj_L[u * W + uw];
-                int v_bit = __builtin_ctzll(lmask);
-                int v = (uw << 6) + v_bit;
 
-                uint64_t new_lmask = lmask & (lmask - 1ULL);
-                adj_L[u * W + uw] = new_lmask;
-                if (new_lmask == 0ULL) {
-                    summary_L[u] = sum_u & (sum_u - 1ULL);
-                }
+    // Fast path 2: ALL odd edges have w >= 3 (heavy_odd.size() == E, e.g., bursty and upper levels of skewed):
+    // Zero branches inside the walk, zero red_mask touches on L->R, unconditional bit-clear on R->L!
+    if (static_cast<int>(heavy_odd.size()) == E) {
+        for (int root = 0; root < n; ++root) {
+            while (summary_L[root] != 0ULL) {
+                int u = root;
+                while (summary_L[u] != 0ULL) {
+                    uint64_t sum_u = summary_L[u];
+                    int uw = __builtin_ctzll(sum_u);
+                    uint64_t lmask = adj_L[u * W + uw];
+                    int v_bit = __builtin_ctzll(lmask);
+                    int v = (uw << 6) + v_bit;
 
-                int u_word = u >> 6;
-                uint64_t u_mask_bit = 1ULL << (u & 63);
-                uint64_t new_rmask_u = adj_R[v * W + u_word] & ~u_mask_bit;
-                adj_R[v * W + u_word] = new_rmask_u;
-                if (new_rmask_u == 0ULL) {
-                    summary_R[v] &= ~(1ULL << u_word);
-                }
-                if ((has_heavy_L[u_word] & u_mask_bit) == 0ULL ||
-                    (red_mask[u * W + uw] & (1ULL << v_bit)) == 0ULL) {
-                    out_red.push_back({static_cast<uint16_t>(u), static_cast<uint16_t>(v), 1});
-                }
+                    uint64_t new_lmask = lmask & (lmask - 1ULL);
+                    adj_L[u * W + uw] = new_lmask;
+                    if (new_lmask == 0ULL) {
+                        summary_L[u] = sum_u & (sum_u - 1ULL);
+                    }
 
-                uint64_t sum_v = summary_R[v];
-                int vw = __builtin_ctzll(sum_v);
-                uint64_t rmask = adj_R[v * W + vw];
-                int u_bit = __builtin_ctzll(rmask);
-                int next_u = (vw << 6) + u_bit;
+                    int u_word = u >> 6;
+                    uint64_t new_rmask_u = adj_R[v * W + u_word] & ~(1ULL << (u & 63));
+                    adj_R[v * W + u_word] = new_rmask_u;
+                    if (new_rmask_u == 0ULL) {
+                        summary_R[v] &= ~(1ULL << u_word);
+                    }
 
-                uint64_t new_rmask = rmask & (rmask - 1ULL);
-                adj_R[v * W + vw] = new_rmask;
-                if (new_rmask == 0ULL) {
-                    summary_R[v] = sum_v & (sum_v - 1ULL);
-                }
+                    uint64_t sum_v = summary_R[v];
+                    int vw = __builtin_ctzll(sum_v);
+                    uint64_t rmask = adj_R[v * W + vw];
+                    int u_bit = __builtin_ctzll(rmask);
+                    int next_u = (vw << 6) + u_bit;
 
-                int v_word = v >> 6;
-                uint64_t v_mask_bit = 1ULL << (v & 63);
-                uint64_t new_lmask_next = adj_L[next_u * W + v_word] & ~v_mask_bit;
-                adj_L[next_u * W + v_word] = new_lmask_next;
-                if (new_lmask_next == 0ULL) {
-                    summary_L[next_u] &= ~(1ULL << v_word);
+                    uint64_t new_rmask = rmask & (rmask - 1ULL);
+                    adj_R[v * W + vw] = new_rmask;
+                    if (new_rmask == 0ULL) {
+                        summary_R[v] = sum_v & (sum_v - 1ULL);
+                    }
+
+                    int v_word = v >> 6;
+                    uint64_t v_mask_bit = 1ULL << (v & 63);
+                    uint64_t new_lmask_next = adj_L[next_u * W + v_word] & ~v_mask_bit;
+                    adj_L[next_u * W + v_word] = new_lmask_next;
+                    if (new_lmask_next == 0ULL) {
+                        summary_L[next_u] &= ~(1ULL << v_word);
+                    }
+                    red_mask[next_u * W + v_word] &= ~v_mask_bit;
+
+                    u = next_u;
+                    if (u == root) break;
                 }
-                if ((has_heavy_L[vw] & (1ULL << u_bit)) == 0ULL) {
-                    out_blue.push_back({static_cast<uint16_t>(next_u), static_cast<uint16_t>(v), 1});
-                } else {
-                    uint64_t& rword_next = red_mask[next_u * W + v_word];
-                    if ((rword_next & v_mask_bit) == 0ULL) {
+            }
+        }
+    } else {
+        // Mixed path (both w == 1 and w >= 3 odd edges exist):
+        // Uses 256-byte L1-resident has_heavy_L bitset to bypass red_mask on vertices without heavy edges!
+        for (int root = 0; root < n; ++root) {
+            while (summary_L[root] != 0ULL) {
+                int u = root;
+                while (summary_L[u] != 0ULL) {
+                    uint64_t sum_u = summary_L[u];
+                    int uw = __builtin_ctzll(sum_u);
+                    uint64_t lmask = adj_L[u * W + uw];
+                    int v_bit = __builtin_ctzll(lmask);
+                    int v = (uw << 6) + v_bit;
+
+                    uint64_t new_lmask = lmask & (lmask - 1ULL);
+                    adj_L[u * W + uw] = new_lmask;
+                    if (new_lmask == 0ULL) {
+                        summary_L[u] = sum_u & (sum_u - 1ULL);
+                    }
+
+                    int u_word = u >> 6;
+                    uint64_t u_mask_bit = 1ULL << (u & 63);
+                    uint64_t new_rmask_u = adj_R[v * W + u_word] & ~u_mask_bit;
+                    adj_R[v * W + u_word] = new_rmask_u;
+                    if (new_rmask_u == 0ULL) {
+                        summary_R[v] &= ~(1ULL << u_word);
+                    }
+                    if ((has_heavy_L[u_word] & u_mask_bit) == 0ULL ||
+                        (red_mask[u * W + uw] & (1ULL << v_bit)) == 0ULL) {
+                        out_red.push_back({static_cast<uint16_t>(u), static_cast<uint16_t>(v), 1});
+                    }
+
+                    uint64_t sum_v = summary_R[v];
+                    int vw = __builtin_ctzll(sum_v);
+                    uint64_t rmask = adj_R[v * W + vw];
+                    int u_bit = __builtin_ctzll(rmask);
+                    int next_u = (vw << 6) + u_bit;
+
+                    uint64_t new_rmask = rmask & (rmask - 1ULL);
+                    adj_R[v * W + vw] = new_rmask;
+                    if (new_rmask == 0ULL) {
+                        summary_R[v] = sum_v & (sum_v - 1ULL);
+                    }
+
+                    int v_word = v >> 6;
+                    uint64_t v_mask_bit = 1ULL << (v & 63);
+                    uint64_t new_lmask_next = adj_L[next_u * W + v_word] & ~v_mask_bit;
+                    adj_L[next_u * W + v_word] = new_lmask_next;
+                    if (new_lmask_next == 0ULL) {
+                        summary_L[next_u] &= ~(1ULL << v_word);
+                    }
+                    if ((has_heavy_L[vw] & (1ULL << u_bit)) == 0ULL) {
                         out_blue.push_back({static_cast<uint16_t>(next_u), static_cast<uint16_t>(v), 1});
                     } else {
-                        rword_next &= ~v_mask_bit; // Colored Blue: clear heavy-red bit!
+                        uint64_t& rword_next = red_mask[next_u * W + v_word];
+                        if ((rword_next & v_mask_bit) == 0ULL) {
+                            out_blue.push_back({static_cast<uint16_t>(next_u), static_cast<uint16_t>(v), 1});
+                        } else {
+                            rword_next &= ~v_mask_bit; // Colored Blue: clear heavy-red bit!
+                        }
                     }
-                }
 
-                u = next_u;
-                if (u == root) break;
+                    u = next_u;
+                    if (u == root) break;
+                }
             }
         }
     }
 
-    // Emit only the heavy odd edges (w >= 3) — no second scan over edges!
+    // Emit only the heavy odd edges (w >= 3) — 100% branchless (since he.w >= 1, both Red and Blue weights are >= 1)!
     for (const auto& he : heavy_odd) {
         has_heavy_L[he.u >> 6] = 0ULL;
         uint64_t& rword = red_mask[he.u * W + (he.v >> 6)];
         uint64_t bit = 1ULL << (he.v & 63);
-        if (rword & bit) {
-            rword &= ~bit; // Colored Red, leaves red_mask 100% zeroed
-            out_red.push_back({he.u, he.v, he.w + 1});
-            out_blue.push_back({he.u, he.v, he.w});
-        } else {
-            out_red.push_back({he.u, he.v, he.w});
-            out_blue.push_back({he.u, he.v, he.w + 1});
-        }
+        int is_red = (rword & bit) != 0ULL;
+        rword &= ~bit; // Leaves red_mask 100% zeroed
+        out_red.push_back({he.u, he.v, he.w + is_red});
+        out_blue.push_back({he.u, he.v, he.w + (1 - is_red)});
     }
     return false;
 }
@@ -213,8 +263,8 @@ void extract_degree2_leaves(
 
     leaf0.weight = 1;
     leaf1.weight = 1;
-    leaf0.perm.assign(n, -1);
-    leaf1.perm.assign(n, -1);
+    if (static_cast<int>(leaf0.perm.size()) != n) leaf0.perm.resize(n);
+    if (static_cast<int>(leaf1.perm.size()) != n) leaf1.perm.resize(n);
 
     int* __restrict p0 = leaf0.perm.data();
     int* __restrict p1 = leaf1.perm.data();

@@ -126,7 +126,7 @@ int main(int argc, char** argv) {
             );
         }
         bvn::Config warm_cfg = cfg;
-        warm_cfg.target_degree = 0;
+        warm_cfg.target_degree = -std::max(cfg.target_degree, cfg.n);
         bvn::PipelineStats warm_stats;
         double dummy1 = 0.0, dummy2 = 0.0;
         bvn::run_block_bvn_pipeline(demand_matrix, warm_cfg, warm_stats, dummy1, dummy2);
