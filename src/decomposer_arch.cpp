@@ -1,5 +1,5 @@
 #include "bvn/decomposer.hpp"
-#include "bvn/euler_trail.hpp"
+#include <algorithm>
 #include <cstdint>
 #include <omp.h>
 #include <vector>
@@ -8,152 +8,187 @@ namespace bvn {
 
 namespace {
 
-bool euler_split_omp_arch(
-    const std::vector<WeightedEdge>& edges,
+/**
+ * Root-level (Depth 0) Architecture-Aware Parallel Split directly from the N x N regularized matrix:
+ * 1. Parallel lock-free 64-bit Bitmask construction using 64-row block partitioning (disjoint uint64_t words in adj_R).
+ * 2. Hardware TZCNT (__builtin_ctzll) + BLSR 2-step (L -> R -> L) Eulerian cycle walk in L1/L2 cache.
+ * 3. Parallel prefix-sum construction of red_edges and blue_edges directly from the matrix (eliminating initial_edges).
+ */
+bool euler_root_split_omp_arch(
+    const std::vector<int>& regularized_matrix,
     int n,
-    bool parallel_walk,
     int num_threads,
     std::vector<WeightedEdge>& out_red,
     std::vector<WeightedEdge>& out_blue
 ) {
-    std::vector<int> deg(2 * n, 0);
-    int E = 0;
-    for (const auto& e : edges) {
-        if (e.w & 1) {
-            deg[e.u]++;
-            deg[n + e.v]++;
-            ++E;
-        }
-    }
+    const int W = (n + 63) >> 6;
+    const size_t mask_size = static_cast<size_t>(n) * W;
 
-    // Symmetry Pruning at Root: when E == 0, Red and Blue subtrees are 100% identical!
-    if (E == 0) {
-        out_red.clear();
-        out_red.reserve(edges.size());
-        for (const auto& e : edges) {
-            int half = e.w >> 1;
-            if (half > 0) out_red.push_back({e.u, e.v, half});
-        }
-        return true;
-    }
+    EulerWorkspace& root_ws = get_thread_workspace();
+    if (root_ws.adj_L.size() < mask_size) root_ws.adj_L.assign(mask_size, 0ULL);
+    if (root_ws.adj_R.size() < mask_size) root_ws.adj_R.assign(mask_size, 0ULL);
+    if (root_ws.red_mask.size() < mask_size) root_ws.red_mask.assign(mask_size, 0ULL);
+    if (static_cast<int>(root_ws.word_head_L.size()) < n) root_ws.word_head_L.resize(n, 0);
+    if (static_cast<int>(root_ws.word_head_R.size()) < n) root_ws.word_head_R.resize(n, 0);
 
-    std::vector<uint8_t> edge_color(E, 0);
+    uint64_t* __restrict adj_L = root_ws.adj_L.data();
+    uint64_t* __restrict adj_R = root_ws.adj_R.data();
+    uint64_t* __restrict red_mask = root_ws.red_mask.data();
 
-    std::vector<int> row_ptr(2 * n + 1, 0);
-    for (int i = 0; i < 2 * n; ++i) {
-        row_ptr[i + 1] = row_ptr[i] + deg[i];
-    }
+    int total_odd_edges = 0;
+    std::vector<int> thread_red_count(num_threads, 0);
+    std::vector<int> thread_blue_count(num_threads, 0);
+    std::vector<int> thread_red_offset(num_threads + 1, 0);
+    std::vector<int> thread_blue_offset(num_threads + 1, 0);
 
-    std::vector<FlatEdge> adj(2 * E);
-    std::vector<int> fill_ptr(row_ptr.begin(), row_ptr.begin() + 2 * n);
-    int odd_id = 0;
-    for (const auto& e : edges) {
-        if (e.w & 1) {
-            int u = e.u;
-            int v = n + e.v;
-            adj[fill_ptr[u]++] = {v, odd_id};
-            adj[fill_ptr[v]++] = {u, odd_id};
-            ++odd_id;
-        }
-    }
-
-    // 64-byte cache-line aligned cursors: prevents cross-core and cross-socket MESI invalidations
-    std::vector<AlignedCursor> cursors(2 * n);
-    for (int i = 0; i < 2 * n; ++i) {
-        cursors[i].head = row_ptr[i];
-        cursors[i].deg = row_ptr[i + 1];
-    }
-
-    std::vector<uint8_t> claimed(E, 0);
-
-    auto claim_next_aligned = [&](int x, int& out_to) -> int {
-        const int end = cursors[x].deg;
-        while (true) {
-            int pos;
-            #pragma omp atomic capture
-            pos = cursors[x].head++;
-            if (pos >= end) return -1;
-            int eid = adj[pos].edge_id;
-            uint8_t prev = __atomic_exchange_n(&claimed[eid], 1, __ATOMIC_ACQ_REL);
-            if (prev == 0) {
-                out_to = adj[pos].to;
-                return eid;
-            }
-        }
-    };
-
-    std::vector<OpenTrail> global_open_trails;
-
-    #pragma omp parallel if(parallel_walk) num_threads(num_threads)
+    #pragma omp parallel num_threads(num_threads) reduction(+:total_odd_edges)
     {
-        std::vector<OpenTrail> local_open;
-        std::vector<int> trail_edges;
-        trail_edges.reserve(256);
+        // Step 1: Parallel Bitmask Construction
+        // Chunk size of 64 rows guarantees that (u >> 6) is unique per thread,
+        // so writes to adj_R[v * W + (u >> 6)] are 100% lock-free and race-free without atomics!
+        #pragma omp for schedule(static, 64)
+        for (int u = 0; u < n; ++u) {
+            const int* __restrict row = &regularized_matrix[static_cast<size_t>(u) * n];
+            uint64_t* __restrict l_row = &adj_L[u * W];
+            const int u_word = u >> 6;
+            const uint64_t u_bit = 1ULL << (u & 63);
 
-        #pragma omp for schedule(guided)
-        for (int root = 0; root < 2 * n; ++root) {
-            while (cursors[root].head < cursors[root].deg) {
-                int next_v = -1;
-                int first_e = claim_next_aligned(root, next_v);
-                if (first_e == -1) break;
-
-                trail_edges.clear();
-                trail_edges.push_back(first_e);
-                int curr = next_v;
-
-                while (true) {
-                    int to_v = -1;
-                    int eid = claim_next_aligned(curr, to_v);
-                    if (eid == -1) break;
-                    trail_edges.push_back(eid);
-                    curr = to_v;
-                    if (curr == root) break;
+            for (int v = 0; v < n; ++v) {
+                int w = row[v];
+                if (w & 1) {
+                    l_row[v >> 6] |= (1ULL << (v & 63));
+                    adj_R[v * W + u_word] |= u_bit;
+                    ++total_odd_edges;
                 }
+            }
+        }
 
-                if (curr == root) {
-                    for (size_t i = 0; i < trail_edges.size(); ++i) {
-                        edge_color[trail_edges[i]] = static_cast<uint8_t>(i & 1);
+        // Step 2: Ultra-fast L1-resident Bitmask + TZCNT/BLSR Eulerian walk
+        #pragma omp single
+        {
+            if (total_odd_edges > 0) {
+                int* __restrict head_L = root_ws.word_head_L.data();
+                int* __restrict head_R = root_ws.word_head_R.data();
+                std::fill(head_L, head_L + n, 0);
+                std::fill(head_R, head_R + n, 0);
+
+                for (int root = 0; root < n; ++root) {
+                    while (true) {
+                        int w = head_L[root];
+                        while (w < W && adj_L[root * W + w] == 0ULL) {
+                            ++w;
+                        }
+                        head_L[root] = w;
+                        if (w >= W) break;
+
+                        int u = root;
+                        while (true) {
+                            int uw = head_L[u];
+                            while (uw < W && adj_L[u * W + uw] == 0ULL) {
+                                ++uw;
+                            }
+                            head_L[u] = uw;
+                            if (uw >= W) break;
+
+                            uint64_t lmask = adj_L[u * W + uw];
+                            int v_bit = __builtin_ctzll(lmask);
+                            int v = (uw << 6) + v_bit;
+
+                            adj_L[u * W + uw] = lmask & (lmask - 1ULL);
+                            adj_R[v * W + (u >> 6)] &= ~(1ULL << (u & 63));
+                            red_mask[u * W + uw] |= (1ULL << v_bit);
+
+                            int vw = head_R[v];
+                            while (adj_R[v * W + vw] == 0ULL) {
+                                ++vw;
+                            }
+                            head_R[v] = vw;
+
+                            uint64_t rmask = adj_R[v * W + vw];
+                            int u_bit = __builtin_ctzll(rmask);
+                            int next_u = (vw << 6) + u_bit;
+
+                            adj_R[v * W + vw] = rmask & (rmask - 1ULL);
+                            adj_L[next_u * W + (v >> 6)] &= ~(1ULL << (v & 63));
+
+                            u = next_u;
+                            if (u == root) break;
+                        }
                     }
-                } else {
-                    local_open.push_back({root, curr, trail_edges});
                 }
             }
         }
 
-        if (!local_open.empty()) {
-            #pragma omp critical
-            {
-                for (auto& t : local_open) {
-                    global_open_trails.push_back(std::move(t));
+        // Step 3: Parallel extraction of out_red and out_blue directly from regularized_matrix + red_mask
+        int tid = omp_get_thread_num();
+        auto& local_red = get_thread_workspace().level_red[0];
+        auto& local_blue = get_thread_workspace().level_blue[0];
+        local_red.clear();
+        local_blue.clear();
+
+        if (total_odd_edges == 0) {
+            #pragma omp for schedule(static)
+            for (int u = 0; u < n; ++u) {
+                const int* __restrict row = &regularized_matrix[static_cast<size_t>(u) * n];
+                for (int v = 0; v < n; ++v) {
+                    int half = row[v] >> 1;
+                    if (half > 0) {
+                        local_red.push_back({u, v, half});
+                    }
+                }
+            }
+        } else {
+            #pragma omp for schedule(static)
+            for (int u = 0; u < n; ++u) {
+                const int* __restrict row = &regularized_matrix[static_cast<size_t>(u) * n];
+                uint64_t* __restrict r_row = &red_mask[u * W];
+                for (int v = 0; v < n; ++v) {
+                    int w = row[v];
+                    if (w > 0) {
+                        int half = w >> 1;
+                        int w_red = half;
+                        int w_blue = half;
+                        if (w & 1) {
+                            uint64_t& rword = r_row[v >> 6];
+                            uint64_t bit = 1ULL << (v & 63);
+                            if (rword & bit) {
+                                ++w_red;
+                                rword &= ~bit;
+                            } else {
+                                ++w_blue;
+                            }
+                        }
+                        if (w_red > 0) local_red.push_back({u, v, w_red});
+                        if (w_blue > 0) local_blue.push_back({u, v, w_blue});
+                    }
                 }
             }
         }
-    }
 
-    color_open_trails(global_open_trails, 2 * n, edge_color);
+        thread_red_count[tid] = static_cast<int>(local_red.size());
+        thread_blue_count[tid] = static_cast<int>(local_blue.size());
 
-    out_red.clear();
-    out_blue.clear();
-    out_red.reserve(edges.size());
-    out_blue.reserve(edges.size());
+        #pragma omp barrier
 
-    odd_id = 0;
-    for (const auto& e : edges) {
-        int half = e.w >> 1;
-        int w_red = half;
-        int w_blue = half;
-        if (e.w & 1) {
-            if (edge_color[odd_id] == 0) {
-                ++w_red;
-            } else {
-                ++w_blue;
+        #pragma omp single
+        {
+            for (int t = 0; t < num_threads; ++t) {
+                thread_red_offset[t + 1] = thread_red_offset[t] + thread_red_count[t];
+                thread_blue_offset[t + 1] = thread_blue_offset[t] + thread_blue_count[t];
             }
-            ++odd_id;
+            out_red.resize(thread_red_offset[num_threads]);
+            if (total_odd_edges > 0) {
+                out_blue.resize(thread_blue_offset[num_threads]);
+            }
         }
-        if (w_red > 0) out_red.push_back({e.u, e.v, w_red});
-        if (w_blue > 0) out_blue.push_back({e.u, e.v, w_blue});
+
+        std::copy(local_red.begin(), local_red.end(), out_red.begin() + thread_red_offset[tid]);
+        if (total_odd_edges > 0) {
+            std::copy(local_blue.begin(), local_blue.end(), out_blue.begin() + thread_blue_offset[tid]);
+        }
     }
-    return false;
+
+    return (total_odd_edges == 0);
 }
 
 void decompose_recursive_omp_arch(
@@ -176,6 +211,7 @@ void decompose_recursive_omp_arch(
     std::vector<WeightedEdge> red_edges;
     std::vector<WeightedEdge> blue_edges;
     red_edges.reserve(edges.size());
+    blue_edges.reserve(edges.size());
 
     bool symmetric = euler_split_sequential_ws(edges, n, tls_ws, red_edges, blue_edges);
     int half_deg = degree >> 1;
@@ -213,60 +249,47 @@ std::vector<ScheduleLeaf> decompose_omp_arch(
     const Config& cfg
 ) {
     std::vector<ScheduleLeaf> leaves(degree);
-    std::vector<WeightedEdge> initial_edges;
-    initial_edges.reserve(static_cast<size_t>(n) * 16);
-
-    for (int u = 0; u < n; ++u) {
-        const int* row = &regularized_matrix[static_cast<size_t>(u) * n];
-        for (int v = 0; v < n; ++v) {
-            if (row[v] > 0) {
-                initial_edges.push_back({u, v, row[v]});
-            }
-        }
-    }
 
     if (degree <= cfg.cutoff_degree || degree == 1) {
-        EulerWorkspace& tls_ws = get_thread_workspace();
-        tls_ws.ensure_capacity(n, degree, degree, static_cast<int>(initial_edges.size()));
-        decompose_recursive_seq_ws(initial_edges, n, degree, 0, 0, tls_ws, leaves);
-    } else {
-        std::vector<WeightedEdge> red_edges;
-        std::vector<WeightedEdge> blue_edges;
-        bool root_symmetric = euler_split_omp_arch(
-            initial_edges, n, true, cfg.num_threads, red_edges, blue_edges
-        );
-        int half_deg = degree >> 1;
+        return decompose_seq(regularized_matrix, n, degree);
+    }
 
-        if (root_symmetric) {
-            #pragma omp parallel num_threads(cfg.num_threads)
+    std::vector<WeightedEdge> red_edges;
+    std::vector<WeightedEdge> blue_edges;
+    bool root_symmetric = euler_root_split_omp_arch(
+        regularized_matrix, n, cfg.num_threads, red_edges, blue_edges
+    );
+    int half_deg = degree >> 1;
+
+    if (root_symmetric) {
+        #pragma omp parallel num_threads(cfg.num_threads)
+        {
+            #pragma omp single
             {
-                #pragma omp single
+                decompose_recursive_omp_arch(
+                    red_edges, n, half_deg, 1, cfg.cutoff_degree, 0, leaves
+                );
+            }
+            #pragma omp for schedule(static)
+            for (int i = 0; i < half_deg; ++i) {
+                leaves[half_deg + i] = leaves[i];
+            }
+        }
+    } else {
+        #pragma omp parallel num_threads(cfg.num_threads)
+        {
+            #pragma omp single nowait
+            {
+                #pragma omp task shared(leaves, red_edges) firstprivate(n, half_deg)
                 {
                     decompose_recursive_omp_arch(
                         red_edges, n, half_deg, 1, cfg.cutoff_degree, 0, leaves
                     );
                 }
-                #pragma omp for schedule(static)
-                for (int i = 0; i < half_deg; ++i) {
-                    leaves[half_deg + i] = leaves[i];
-                }
-            }
-        } else {
-            #pragma omp parallel num_threads(cfg.num_threads)
-            {
-                #pragma omp single nowait
-                {
-                    #pragma omp task shared(leaves, red_edges) firstprivate(n, half_deg)
-                    {
-                        decompose_recursive_omp_arch(
-                            red_edges, n, half_deg, 1, cfg.cutoff_degree, 0, leaves
-                        );
-                    }
-                    decompose_recursive_omp_arch(
-                        blue_edges, n, half_deg, 1, cfg.cutoff_degree, half_deg, leaves
-                    );
-                    #pragma omp taskwait
-                }
+                decompose_recursive_omp_arch(
+                    blue_edges, n, half_deg, 1, cfg.cutoff_degree, half_deg, leaves
+                );
+                #pragma omp taskwait
             }
         }
     }
