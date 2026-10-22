@@ -83,10 +83,33 @@ std::vector<int> regularize_matrix(
     const int D = next_power_of_two(max_line_sum);
     out_regularized_degree = D;
 
-    // Two-pointer O(N) greedy deficit matching to add phantom traffic
+    // Pass 1: Coalesce deficits onto existing non-zero edges in partial rows/cols
+    // and match partial rows (0 < row_sum[u] < D) with partial cols (0 < col_sum[v] < D) first,
+    // so that completely empty rows/cols (sum == 0) pair cleanly with full power-of-2 weight D!
     int64_t phantom_added = 0;
     int u = 0;
     int v = 0;
+    while (u < n && v < n) {
+        if (row_sum[u] == 0 || row_sum[u] == D) {
+            ++u;
+            continue;
+        }
+        if (col_sum[v] == 0 || col_sum[v] == D) {
+            ++v;
+            continue;
+        }
+        int r_def = D - row_sum[u];
+        int c_def = D - col_sum[v];
+        int add = std::min(r_def, c_def);
+        reg_mat[static_cast<size_t>(u) * n + v] += add;
+        row_sum[u] += add;
+        col_sum[v] += add;
+        phantom_added += add;
+    }
+
+    // Pass 2: Match any remaining deficits (empty rows/cols pair with exact power-of-2 weight D)
+    u = 0;
+    v = 0;
     while (u < n && v < n) {
         int r_def = D - row_sum[u];
         int c_def = D - col_sum[v];

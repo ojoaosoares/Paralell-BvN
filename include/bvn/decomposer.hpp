@@ -19,10 +19,32 @@ struct EulerWorkspace {
     std::vector<uint64_t> adj_R;      // Level-1 Bitmask adjacency for Right vertices (N * num_words)
     std::vector<uint64_t> summary_L;  // Level-0 Summary Bitmask of non-zero words for Left vertices (size N)
     std::vector<uint64_t> summary_R;  // Level-0 Summary Bitmask of non-zero words for Right vertices (size N)
-    std::vector<uint64_t> red_mask;   // Used by root-level parallel split (N * num_words)
+    std::vector<uint64_t> has_heavy_L;// L1 Bitset (num_words uint64_t = 256B for N=2048) marking rows u with heavy odd edges
+    std::vector<uint64_t> red_mask;   // Used only for vertices u where has_heavy_L bit is set (N * num_words)
     std::vector<WeightedEdge> heavy_odd_edges; // Odd edges with w >= 3 (typically < 1% of edges)
     std::vector<WeightedEdge> level_red[kMaxRecursionDepth];
     std::vector<WeightedEdge> level_blue[kMaxRecursionDepth];
+
+    // Zero-contention thread-local telemetry counters
+    int64_t splits = 0;
+    int64_t sym_pruned = 0;
+    int64_t unit_odd_fast = 0;
+    int64_t heavy_odd = 0;
+    int64_t deg2_calls = 0;
+    int64_t edges_scanned = 0;
+    int64_t odd_edges_walked = 0;
+    double active_time_ms = 0.0;
+
+    void reset_counters() {
+        splits = 0;
+        sym_pruned = 0;
+        unit_odd_fast = 0;
+        heavy_odd = 0;
+        deg2_calls = 0;
+        edges_scanned = 0;
+        odd_edges_walked = 0;
+        active_time_ms = 0.0;
+    }
 
     void ensure_capacity(int n, int max_csr_deg, int max_level_deg, int max_edges) {
         (void)max_csr_deg;
@@ -32,6 +54,7 @@ struct EulerWorkspace {
         if (adj_R.size() < mask_size) adj_R.assign(mask_size, 0ULL);
         if (summary_L.size() < static_cast<size_t>(n)) summary_L.assign(n, 0ULL);
         if (summary_R.size() < static_cast<size_t>(n)) summary_R.assign(n, 0ULL);
+        if (has_heavy_L.size() < static_cast<size_t>(num_words)) has_heavy_L.assign(num_words, 0ULL);
         if (red_mask.size() < mask_size) red_mask.assign(mask_size, 0ULL);
         if (heavy_odd_edges.capacity() < static_cast<size_t>(n * 4)) {
             heavy_odd_edges.reserve(static_cast<size_t>(n * 4));
@@ -103,7 +126,8 @@ std::vector<ScheduleLeaf> decompose_omp_arch(
     const std::vector<int>& regularized_matrix,
     int n,
     int degree,
-    const Config& cfg
+    const Config& cfg,
+    PipelineStats* stats = nullptr
 );
 
 /**
@@ -113,14 +137,21 @@ std::vector<ScheduleLeaf> decompose_bvn(
     const std::vector<int>& regularized_matrix,
     int n,
     int degree,
-    const Config& cfg
+    const Config& cfg,
+    PipelineStats* stats = nullptr
 );
 
 /**
  * Dynamically selects the optimal spatial block factor K (splitting N x N into K x K sub-matrices
  * of dimension N_b = N / K) based on switch port count N, OpenMP thread count, and L1d cache size.
  */
-int select_optimal_block_factor(int n, int num_threads, int requested_k = 0);
+int select_optimal_block_factor(
+    int n,
+    int num_threads,
+    int requested_k = 0,
+    const std::vector<int>* demand_matrix = nullptr,
+    int target_degree = 0
+);
 
 /**
  * Executes the Spatial Block-Diagonal BvN Pipeline (OMP_BLOCK):

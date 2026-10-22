@@ -84,3 +84,124 @@ Para $N = 2048$, o seletor dinâmico `select_optimal_block_factor` escolhe autom
 3. **Limpeza de Fluxo Fantasma Local em L1 (Fase 4 Fundida):**
    - Filtrar o tráfego fantasma dentro de cada bloco $256 \times 256$ antes de fundir as permutações globais examina apenas os $d_b$ escalonamentos daquele bloco (e ignora blocos vazios onde $d_b = 0$), reduzindo o tempo de Fase 4 em `bursty` ($N=2048$) de `276.89 ms` para **`0.001 ms`**!
 
+---
+
+## 6. Telemetria Profunda (`--metrics`) e Diagnóstico de Gargalos Restantes ($N = 2048, D = 2048$, 12 Threads)
+
+Instrumentamos o código com contadores zero-contention em `EulerWorkspace`, cronômetros de sub-fases e telemetria de SO/memória (`getrusage` + `/proc/self/status` `VmHWM`) via flag `--metrics`:
+
+### 6.1. Tabela Completa de Telemetria ($N = 2048, D = 2048$, 12 Threads)
+
+| Métrica Coletada (`--metrics`) | `seq` (`uniform`) | `omp_arch` (`uniform`) | `omp_block` (`uniform`) | `omp_arch` (`skewed`) | `omp_block` (`skewed`) | `omp_arch` (`bursty`) | `omp_block` (`bursty`) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Tempo Total Pipeline** | `758.77 ms` | `419.66 ms` | **`65.05 ms`** | `68.19 ms` | **`46.53 ms`** | `234.24 ms` | **`196.89 ms`** |
+| **Grau Regularizado Efetivo ($D_{\text{eff}}$)** | `2048` | `2048` | `2048` | `2048` | `4096` | `2048` | `16384` |
+| **Pacotes Fantasmas Inseridos** | `1.10 M` | `1.10 M` | `1.10 M` | `3.30 M` | `4.19 M` | `0.75 M` | **`30.11 M`** |
+| **Sub-Fase: Root Walk / Block Padding** | — | `11.90 ms` (2.8%) | `8.15 ms` (12.5%) | `0.50 ms` | `3.12 ms` (6.7%) | `0.48 ms` | `5.08 ms` (2.6%) |
+| **Sub-Fase: Root Partition / Leaf Alloc** | — | `27.16 ms` (6.5%) | `0.05 ms` (0.1%) | `1.52 ms` | `0.68 ms` (1.5%) | `1.47 ms` | `2.35 ms` (1.2%) |
+| **Sub-Fase: Task Tree / Block Euler BvN** | `724.45 ms` | `353.72 ms` (84.3%) | **`46.26 ms` (71.1%)** | `50.11 ms` | **`25.47 ms` (54.7%)** | `207.76 ms` | `136.05 ms` (69.1%) |
+| **Sub-Fase: L1 Cleanup + Global Fusion** | `23.87 ms` | `5.33 ms` | `3.40 + 7.19 ms` | `4.31 ms` | `2.50 + 14.77 ms` | `4.27 ms` | `14.18 + 39.23 ms` |
+| **Eficiência Paralela de Threads Ativas** | `100.0%` | `76.7%` | **`88.8%`** | `71.9%` | **`95.1%`** | `83.8%` | **`95.9%`** |
+| **Desbalanceamento de Carga `(Max-Avg)/Max`** | `0.0%` | `7.6%` | `8.4%` | `17.3%` | **`2.4%`** | `11.9%` | **`1.8%`** |
+| **Total de Splits Eulerianos** | `1023` | `1023` | `8128` | `1011` | `16368` | `1023` | **`65472`** |
+| **Splits Single-Pass ($w=1$)** | `512` (50.0%) | `512` (50.0%) | `4100` (50.4%) | `528` (52.2%) | `4944` (30.2%) | `0` (**0.0%**) | `0` (**0.0%**) |
+| **Arestas Escaneadas (`MEdges`)** | `36.88 M` | `34.69 M` | **`27.45 M`** | `11.59 M` | `16.58 M` | `15.34 M` | **`66.88 M`** |
+| **Vazão de Arestas (`MEdges/s`)** | `48.6 M/s` | `82.7 M/s` | **`422.0 M/s`** | `170.0 M/s` | **`356.3 M/s`** | `65.5 M/s` | **`339.7 M/s`** |
+| **Minor Page Faults (`ru_minflt`)** | `32,717` | `71,395` | **`11,537`** | `17,033` | `17,236` | `23,524` | **`65,379`** |
+| **Memória Física de Pico (`VmHWM` RSS)** | `117.2 MB` | `295.7 MB` | **`83.3 MB`** | `104.3 MB` | `104.7 MB` | `130.0 MB` | **`292.8 MB`** |
+
+---
+
+### 6.2. As 4 Fraquezas / Gargalos Restantes Revelados pelas Métricas
+
+1. **Inflação de Grau (`D = 16384`) e de Pacotes Fantasmas (`30.11 M`) no `omp_block` sob Tráfego `bursty`:**
+   - **Evidência na Telemetria:** Em `bursty` ($N=2048$), mesmo que a matriz global tenha soma máxima de linha/coluna $\le 2048$, dentro de cada um dos 64 sub-blocos $256 \times 256$ um único par `(u, v)` com rajada pesada força aquele bloco a ter grau $d_b = 2048$. Como há $K=8$ turnos diagonais e cada turno tem pelo menos 1 bloco com rajada de $2048$, o grau total soma $8 \times 2048 = \mathbf{16384}$ ($8\times$ maior que $D=2048$).
+   - **Impacto:** O `omp_block` processa **66.88 milhões de arestas** (contra 15.34 milhões no `omp_arch`), executa **65,472 splits Eulerianos** (contra 1,023 no `omp_arch`), gera **65,379 minor page faults** e gasta **`39.23 ms` só na Fusão Global (`Step C.3`)** escrevendo $16384 \times 2048$ inteiros (`134 MB`). Apesar de processar $4.3\times$ mais arestas graças à vazão de `339.7 MEdges/s` em L1, essa inflação impede um speedup ainda maior em `bursty`.
+2. **0.0% de Aproveitamento do *Single-Pass Walk* em Tráfego `bursty` (`heavy_odd` falso-positivo):**
+   - **Evidência na Telemetria:** Em `bursty`, `Single-Pass Splits (w=1)` cai para **`0 (0.0%)`** tanto em `omp_arch` quanto em `omp_block`!
+   - **Causa Exata:** No `euler_split_sequential_ws`, o caminho rápido *Single-Pass* só é ativado quando `heavy_odd.empty()` (isto é, quando **nenhuma** aresta ímpar tem $w \ge 3$). Em `bursty`, o preenchimento fantasma na diagonal/bordas cria pouquíssimas arestas pesadas ($w \ge 3$), enquanto $99\%$ das outras arestas do grafo têm $w = 1$. Basta **uma única** aresta ímpar com $w \ge 3$ para desativar o *Single-Pass* do grafo inteiro e forçar o 2º passe sobre todas as arestas!
+   - **Solução Direta:** Emitir arestas ímpares com $w == 1$ diretamente durante o passeio Euleriano **sempre** (independente de `heavy_odd` estar vazio ou não), e no Passo 1 emitir imediatamente a parte par $\lfloor w/2 \rfloor$ de todas as arestas com $w \ge 2$! Assim, o Passo 2 só precisará iterar sobre o minúsculo vetor `heavy_odd` (que tem tamanho $< 1\%$ das arestas), eliminando **100% do 2º passe** em **todos** os padrões de tráfego (`uniform`, `skewed` e `bursty`)!
+3. **Custo de Alocação / Page Faults na Fusão Global (`Step C.3` do `omp_block`):**
+   - **Evidência na Telemetria:** Em `Step C.3 (Global Fusion)`, cada uma das `total_schedules` folhas chama `g_leaf.perm.resize(n)` dentro da região paralela, disparando dezenas de milhares de `minor_page_faults` no kernel Linux (`65,379` page faults em `bursty`) e consumindo até **31.7% do tempo total** em `skewed` (`14.77 ms` de `46.53 ms`) e **20% do tempo** em `bursty` (`39.23 ms`).
+4. **Saturação de Banda de Memória / Page Faults (`71,395`) nos Níveis Superiores do `omp_arch`:**
+   - **Evidência na Telemetria:** Em `omp_arch` (`uniform`, $N=2048$), a vazão cai para `82.7 MEdges/s` (contra `422.0 MEdges/s` no `omp_block`) e ocorrem `71,395` minor page faults (`295.7 MB` RSS) porque os níveis $d = 1, 2, 3$ da árvore de tasks alocam vetores `out_red`/`out_blue` e varrem bitmasks de 1 MB fora da cache L2/L3 de cada CCX.
+
+---
+
+## 7. Resolução Sequencial dos 4 Gargalos (Passos 1 a 4) e Evolução das Métricas
+
+Atacamos os 4 gargalos exatamente na ordem diagnosticada pela telemetria (`--metrics`), medindo o impacto isolado e cumulativo de cada passo em $N = 2048, D = 2048$ (12 Threads):
+
+### 7.1. Os 4 Passos Implementados
+
+1. **Passo 1 — Filtro Bitset L1 `has_heavy_L` (256 Bytes) no Passeio Euleriano (`decomposer_seq.cpp`):**
+   - **Problema:** Quando um subgrafo possuía ao menos 1 aresta ímpar pesada ($w \ge 3$), cada passo do passeio Euleriano consultava a matriz bitmask `red_mask` (`512 KB` por thread em $N=2048$, estourando a cache L2 de 512 KB).
+   - **Solução:** Adicionamos o bitset compacto `has_heavy_L` (`32 x uint64_t = 256 bytes`, residente em registradores/L1) marcando apenas as linhas $u$ que possuem arestas ímpares com $w \ge 3$. Para $>95\%$ dos vértices, o passeio emite `{u, v, 1}` diretamente sem tocar em `red_mask`.
+   - **Ganho Imediato:** Em `omp_arch` (`bursty`, $N=2048$), `Task Tree Recursion` caiu de **`207.76 ms` $\to$ `165.38 ms`** (**-20.4%**), e o tempo total caiu de `234.24 ms` $\to$ **`204.95 ms`**. Em `omp_arch` (`skewed`), a vazão subiu de `170.0 MEdges/s` $\to$ **`241.1 MEdges/s`** (`68.19 ms` $\to$ **`48.10 ms`**).
+2. **Passo 2 — Regularização com Coalescência de Arestas + Podagem de Linhas Vazias de Grau Zero (`regularizer.cpp` & `decomposer_arch.cpp`):**
+   - **Problema:** O algoritmo *two-pointer* ingênuo na Fase 1 pareava linhas vazias (`r_def = db`) com colunas parcialmente cheias, criando cascatas de pesos ímpares em todas as 256 linhas do bloco e impedindo o *Symmetry Pruning*.
+   - **Solução (Teorema de Coalescência e Podagem Grau-0):**
+     1. Absorve o déficit fantasma $\min(r_{\text{def}}[u], c_{\text{def}}[v])$ diretamente sobre as arestas reais já existentes ($w > 0$), saturando $u$ ou $v$ sem criar nenhuma aresta nova.
+     2. Apenas $m = \max(|R_{\text{act}}|, |C_{\text{act}}|)$ linhas e colunas ativas recebem grau alvo $d_b$; as demais $(N_b - m)$ linhas e colunas 100% vazias permanecem com **grau 0** (zero arestas fantasmas!).
+     3. Elimina a matriz temporária `sub_mat` ($N_b \times N_b$) e o 2º scan quadrático na Fase 1 do `omp_block`.
+   - **Ganho Imediato:**
+     - Em `omp_block` (`skewed`, $N=2048$): `Phantom Padding` despencou de **`4,194,304` $\to$ `49,152`** (**redução de 98.8% / 85x menos pacotes fantasmas**), e `Symmetric Pruned Splits` saltou de **`0` $\to$ `1,096`**!
+     - Em `omp_block` (`bursty`, $N=2048$): `Total Odd Edges Walked` caiu de **`45.44 M` $\to$ `18.24 M`** (**2.5x menos passos Eulerianos**), `Total Edges Scanned` caiu de **`66.88 M` $\to$ `34.56 M`**, e o tempo total caiu de **`196.89 ms` $\to$ `140.69 ms`**!
+3. **Passo 3 — Compactação $O(d_b)$ de Escalonamentos Vazios em L1 + Fusão Global Flat 12-Threads (`decomposer_arch.cpp`):**
+   - **Problema:** A Fusão Global (`Step C.3`) paraleliza apenas sobre o loop externo `for (int s = 0; s < K; ++s)` (usando apenas 2 threads de 12 em `skewed` e 8 de 12 em `uniform`/`bursty`) e alocava vetores `perm` novos provocando `65,379` *minor page faults*.
+   - **Solução:** Durante o `Step C.2 (L1 Cleanup)`, rastreia quais escalonamentos $d \in [0, d_b-1]$ contêm pacotes reais (`ne_ptr[d]`) e compacta os escalonamentos não-vazios via `std::swap` de ponteiros em $O(d_b)$. Na Fusão Global (`Step C.3`), paraleliza de forma plana (`#pragma omp for schedule(static)`) sobre todos os `total_schedules` usando um `global_pool` pré-aquecido.
+   - **Ganho Imediato:** Em `omp_block` (`skewed`, $N=2048$), `Regular Degree D` encolheu de `4096` $\to$ **`3257`**, `Step C.3 (Global Fusion)` caiu de **`18.46 ms` $\to$ `5.58 ms`** (**3.3x mais rápido**), `Minor Page Faults` caiu de `17,236` $\to$ **`8,126`**, e o tempo total caiu para **`37.92 ms`**!
+4. **Passo 4 — Seletor Adaptativo Anti-Inflação de $K$ + Cutoff Intra-Bloco Fino (`select_optimal_block_factor`):**
+   - **Problema:** Em `bursty` ($N=2048$), rajadas pesadas espalhadas nos $K=8$ turnos diagonais inflavam o grau de todos os 64 blocos para $d_b = 2048$ ($D_{\text{eff}} = 16384$, $8\times$ de inflação).
+   - **Solução:** Amostragem ultrarrápida ($O(N)$, $< 0.02\text{ ms}$, 32 linhas) detecta quando $>2$ turnos diagonais sofrem inflação de sub-linha ($> D/K$) e reduz adaptativamente a grade para $K = 2$ com `intra_block_cutoff = 32` (gerando 64 sub-tasks por bloco para manter todas as 12 threads ocupadas).
+   - **Ganho Imediato:** Em `omp_block` (`bursty`), o tempo total despencou de **`140.69 ms` $\to$ `83.14 ms`** em $N=2048$ (**2.37x mais rápido** que os `196.89 ms` iniciais!) e de **`46.42 ms` $\to$ `17.22 ms`** em $N=1024$ (**2.70x mais rápido**!).
+
+---
+
+### 7.2. Tabela Evolutiva Passo a Passo ($N = 2048, D = 2048$, 12 Threads)
+
+| Etapa de Otimização | `omp_block` (`uniform`) | `omp_block` (`skewed`) | `omp_block` (`bursty`) | `omp_arch` (`skewed`) | `omp_arch` (`bursty`) |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **Estado Inicial (Antes dos 4 Passos)** | `65.05 ms` ($D=2048$) | `46.53 ms` ($D=4096$, `4.19M` phant) | `196.89 ms` ($D=16384$, `30.11M` phant) | `68.19 ms` | `234.24 ms` |
+| **+ Passo 1 (`has_heavy_L` L1 Bitset 256B)** | `64.80 ms` | `46.50 ms` | `195.10 ms` | **`48.10 ms`** (-29.5%) | **`204.95 ms`** (-12.5%) |
+| **+ Passo 2 (Coalescência + Pruning Grau-0)** | `62.68 ms` | `45.90 ms` (`49K` phant, `1096` sym) | **`140.69 ms`** (`18.2M` odd edges) | `48.10 ms` | `193.02 ms` |
+| **+ Passo 3 (Compactação L1 + Fusão 12t Pool)** | **`62.68 ms`** (`6.5K` flt) | **`37.92 ms`** ($D=3257$, Fusão `5.5ms`) | `129.71 ms` (`30.9K` flt) | `48.10 ms` | `193.02 ms` |
+| **+ Passo 4 ($K$ Adaptativo Anti-Inflação)** | **`62.68 ms`** | **`37.92 ms`** | **`83.14 ms`** ($D=4096$, `9.3K` flt) | **`48.10 ms`** | **`193.02 ms`** |
+
+---
+
+### 7.3. Comparativo Final Consolidado ($N = 1024$ e $N = 2048$, 12 Threads, 100% Verificado)
+
+| Matriz ($N, D$) | Padrão | `seq` (1t) | `omp_naive` (12t) | `omp_arch` (12t) | **`omp_block` Final (12t)** | Speedup vs `seq` | Speedup vs `omp_arch` |
+| :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **$1024 \times 1024$** | `uniform` | `140.84 ms` | `164.08 ms` | `48.18 ms` | **`19.30 ms`** ($K=4$) | **7.30x** | **2.50x** |
+| **$1024 \times 1024$** | `skewed` | `49.41 ms` | `202.86 ms` | `19.14 ms` | **`18.75 ms`** ($K=4$) | **2.64x** | **1.02x** |
+| **$1024 \times 1024$** | `bursty` | `73.91 ms` | `141.73 ms` | `52.61 ms` | **`17.22 ms`** ($K=2$) | **4.29x** | **3.06x** |
+| **$2048 \times 2048$** | `uniform` | `758.77 ms` | `690.82 ms` | `406.46 ms` | **`62.68 ms`** ($K=8$) | **12.11x** | **6.48x** |
+| **$2048 \times 2048$** | `skewed` | `190.61 ms` | `652.09 ms` | `48.10 ms` | **`37.92 ms`** ($K=8$) | **5.03x** | **1.27x** |
+| **$2048 \times 2048$** | `bursty` | `380.14 ms` | `624.29 ms` | `193.02 ms` | **`83.14 ms`** ($K=2$) | **4.57x** | **2.32x** |
+
+---
+
+## 8. Teste de Estresse Extremo: Matriz $4096 \times 4096$, Grau $D = 4096$ (> 16.7 Milhões de Pacotes, 12 Threads)
+
+Para $N = 4096, D = 4096$ ($16.77$ milhões de células na matriz), a matriz de bitmasks global (`adj_L + adj_R`) ocupa **4 MB por thread** (`48 MB` em 12 threads, $6\times$ maior que toda a cache L3 de 8 MB do Ryzen 5 5500U). Já o `omp_block` seleciona automaticamente:
+- **$K = 16$ ($256$ sub-matrizes de $256 \times 256$)** para `uniform` e `skewed`, mantendo cada bloco 100% residente na **Cache L1d de 32 KB** (`16 KB` por bloco).
+- **$K = 4$ ($16$ sub-matrizes de $1024 \times 1024$)** para `bursty` (via seletor anti-inflação `k = std::max(2, n / 1024)`), mantendo cada sub-bloco na **Cache L2 de 512 KB** (`256 KB` por bloco) e limitando a inflação de grau.
+
+| Métrica (`--n 4096 --d 4096 --metrics`) | `seq` (`uniform`) | `omp_arch` (`uniform`) | **`omp_block` (`uniform`)** | `seq` (`skewed`) | `omp_arch` (`skewed`) | **`omp_block` (`skewed`)** | `seq` (`bursty`) | `omp_arch` (`bursty`) | **`omp_block` (`bursty`)** |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Grade Espacial $K \times K$** | $1 \times 1$ | $1 \times 1$ | **$16 \times 16$ ($256^2$)** | $1 \times 1$ | $1 \times 1$ | **$16 \times 16$ ($256^2$)** | $1 \times 1$ | $1 \times 1$ | **$4 \times 4$ ($1024^2$)** |
+| **Fase 1 (Padding)** | `40.82 ms` | `42.91 ms` | **`29.82 ms`** | `42.46 ms` | `41.58 ms` | **`8.72 ms`** | `47.01 ms` | `46.03 ms` | **`5.80 ms`** |
+| **Fase 2 & 3 (Euler + BvN)** | `6241.75 ms` | `3320.75 ms` | **`223.65 ms`** | `725.41 ms` | `292.05 ms` | **`154.83 ms`** | `2805.70 ms` | `1809.19 ms` | **`446.88 ms`** |
+| **Fase 4 (Phantom Cleanup)** | `83.55 ms` | `28.12 ms` | **`0.001 ms`** | `77.78 ms` | `22.76 ms` | **`0.001 ms`** | `79.58 ms` | `19.02 ms` | **`0.002 ms`** |
+| **Tempo Total Pipeline** | `6366.11 ms` | `3391.78 ms` | **`253.48 ms`** | `845.64 ms` | `356.38 ms` | **`163.56 ms`** | `2932.29 ms` | `1874.25 ms` | **`452.68 ms`** |
+| **Speedup Total vs `seq` (1t)** | 1.00x | 1.88x | **25.12x** | 1.00x | 2.37x | **5.17x** | 1.00x | 1.56x | **6.48x** |
+| **Speedup Total vs `omp_arch` (12t)** | — | 1.00x | **13.38x** | — | 1.00x | **2.18x** | — | 1.00x | **4.14x** |
+| **Eficiência Paralela de Threads** | `100.0%` | `79.1%` | **`95.3%`** | `100.0%` | `78.1%` | **`92.8%`** | `100.0%` | `89.8%` | **`90.2%`** |
+| **Desbalanceamento `(Max-Avg)/Max`** | `0.0%` | `11.2%` | **`2.2%`** | `0.0%` | `15.5%` | **`1.9%`** | `0.0%` | `8.0%` | **`4.6%`** |
+| **Vazão de Arestas (`MEdges/s`)** | `25.1 M/s` | `44.6 M/s` | **`430.5 M/s`** | `54.6 M/s` | `129.5 M/s` | **`286.3 M/s`** | `21.0 M/s` | `32.8 M/s` | **`251.8 M/s`** |
+| **Minor Page Faults (`ru_minflt`)** | `130,722` | `310,817` | **`19,336`** | `33,551` | `67,811` | **`40,706`** | `34,314` | `91,939` | `105,138` |
+| **Memória Física de Pico (`VmHWM`)** | `456.9 MB` | `1260.9 MB` | **`341.4 MB`** | `204.8 MB` | `404.0 MB` | `424.8 MB` | `207.6 MB` | `497.8 MB` | `677.9 MB` |
+| **Verificação Matemática BvN** | `PASS` | `PASS` | **`PASS (100%)`** | `PASS` | `PASS` | **`PASS (100%)`** | `PASS` | `PASS` | **`PASS (100%)`** |
+

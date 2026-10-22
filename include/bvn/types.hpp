@@ -80,10 +80,11 @@ struct Config {
     TrafficPattern pattern = TrafficPattern::UNIFORM;
     bool verify = true;                           // Run strict mathematical verification
     bool csv_output = false;                      // Output single-line CSV for scripts
+    bool detailed_metrics = false;                // Collect and print deep microarchitectural & algorithmic telemetry
 };
 
 /**
- * Timing and statistics collected across the 4 pipeline phases
+ * Timing and deep telemetry statistics collected across the 4 pipeline phases
  */
 struct PipelineStats {
     double phase1_padding_ms = 0.0;
@@ -95,6 +96,43 @@ struct PipelineStats {
     int64_t total_real_packets = 0;
     int64_t total_phantom_packets = 0;
     bool verified_ok = false;
+
+    // Deep Sub-Phase Breakdown (ms)
+    double sub_root_bitmask_ms = 0.0;
+    double sub_root_walk_ms = 0.0;
+    double sub_root_extract_ms = 0.0;
+    double sub_tree_tasks_ms = 0.0;
+    double sub_block_alloc_ms = 0.0;
+    double sub_block_decomp_ms = 0.0;
+    double sub_block_cleanup_ms = 0.0;
+    double sub_block_fusion_ms = 0.0;
+
+    // Thread Utilization & Load Balancing
+    double thread_min_ms = 0.0;
+    double thread_avg_ms = 0.0;
+    double thread_max_ms = 0.0;
+    double load_imbalance_pct = 0.0;
+    double parallel_efficiency_pct = 0.0;
+
+    // Algorithmic Graph & Split Counters
+    int64_t total_splits = 0;
+    int64_t symmetric_pruned_splits = 0;
+    int64_t unit_odd_fast_splits = 0;
+    int64_t heavy_odd_splits = 0;
+    int64_t deg2_leaf_calls = 0;
+    int64_t total_edges_scanned = 0;
+    int64_t total_odd_edges_walked = 0;
+    int empty_blocks_skipped = 0;
+    int hotspot_blocks_tasked = 0;
+    int min_block_degree = 0;
+    int max_block_degree = 0;
+
+    // OS / Memory / Hardware Resource Telemetry (getrusage)
+    long minor_page_faults = 0;
+    long major_page_faults = 0;
+    long voluntary_ctx_switches = 0;
+    long involuntary_ctx_switches = 0;
+    long peak_rss_kb = 0;
 };
 
 } // namespace bvn
