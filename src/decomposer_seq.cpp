@@ -16,12 +16,18 @@ bool euler_split_sequential_ws(
     uint64_t* __restrict adj_L = ws.adj_L.data();
     uint64_t* __restrict adj_R = ws.adj_R.data();
     uint64_t* __restrict red_mask = ws.red_mask.data();
+    uint64_t* __restrict summary_L = ws.summary_L.data();
+    uint64_t* __restrict summary_R = ws.summary_R.data();
 
     int E = 0;
     for (const auto& e : edges) {
         if (e.w & 1) {
-            adj_L[e.u * W + (e.v >> 6)] |= (1ULL << (e.v & 63));
-            adj_R[e.v * W + (e.u >> 6)] |= (1ULL << (e.u & 63));
+            int uw = e.v >> 6;
+            int vw = e.u >> 6;
+            adj_L[e.u * W + uw] |= (1ULL << (e.v & 63));
+            adj_R[e.v * W + vw] |= (1ULL << (e.u & 63));
+            summary_L[e.u] |= (1ULL << uw);
+            summary_R[e.v] |= (1ULL << vw);
             ++E;
         }
     }
@@ -36,55 +42,56 @@ bool euler_split_sequential_ws(
         return true;
     }
 
-    int* __restrict head_L = ws.word_head_L.data();
-    int* __restrict head_R = ws.word_head_R.data();
-    std::fill(head_L, head_L + n, 0);
-    std::fill(head_R, head_R + n, 0);
-
-    // Branchless 2-step (L -> R -> L) Eulerian cycle walk using hardware TZCNT (__builtin_ctzll) and BLSR
+    // 2-Level Hierarchical Bitmask Eulerian cycle walk using double TZCNT (__builtin_ctzll) and BLSR
     for (int root = 0; root < n; ++root) {
-        while (true) {
-            int w = head_L[root];
-            while (w < W && adj_L[root * W + w] == 0ULL) {
-                ++w;
-            }
-            head_L[root] = w;
-            if (w >= W) break;
-
+        while (summary_L[root] != 0ULL) {
             int u = root;
-            while (true) {
+            while (summary_L[u] != 0ULL) {
                 // Step 1: L -> R (u -> v), colored Red
-                int uw = head_L[u];
-                while (uw < W && adj_L[u * W + uw] == 0ULL) {
-                    ++uw;
-                }
-                head_L[u] = uw;
-                if (uw >= W) break;
-
+                uint64_t sum_u = summary_L[u];
+                int uw = __builtin_ctzll(sum_u);
                 uint64_t lmask = adj_L[u * W + uw];
                 int v_bit = __builtin_ctzll(lmask);
                 int v = (uw << 6) + v_bit;
 
-                // Clear (u, v) in adj_L (BLSR) and adj_R, and mark (u, v) in red_mask
-                adj_L[u * W + uw] = lmask & (lmask - 1ULL);
-                adj_R[v * W + (u >> 6)] &= ~(1ULL << (u & 63));
+                // Clear (u, v) in adj_L (BLSR) and summary_L
+                uint64_t new_lmask = lmask & (lmask - 1ULL);
+                adj_L[u * W + uw] = new_lmask;
+                if (new_lmask == 0ULL) {
+                    summary_L[u] = sum_u & (sum_u - 1ULL);
+                }
+
+                // Clear (u, v) in adj_R and summary_R, and mark in red_mask
+                int u_word = u >> 6;
+                uint64_t new_rmask_u = adj_R[v * W + u_word] & ~(1ULL << (u & 63));
+                adj_R[v * W + u_word] = new_rmask_u;
+                if (new_rmask_u == 0ULL) {
+                    summary_R[v] &= ~(1ULL << u_word);
+                }
                 red_mask[u * W + uw] |= (1ULL << v_bit);
 
                 // Step 2: R -> L (v -> next_u), colored Blue
-                // Since every vertex in R has even degree, v is guaranteed to have an outgoing edge!
-                int vw = head_R[v];
-                while (adj_R[v * W + vw] == 0ULL) {
-                    ++vw;
-                }
-                head_R[v] = vw;
-
+                // Since every vertex in R has even degree, summary_R[v] != 0ULL is guaranteed!
+                uint64_t sum_v = summary_R[v];
+                int vw = __builtin_ctzll(sum_v);
                 uint64_t rmask = adj_R[v * W + vw];
                 int u_bit = __builtin_ctzll(rmask);
                 int next_u = (vw << 6) + u_bit;
 
-                // Clear (next_u, v) in adj_R (BLSR) and adj_L
-                adj_R[v * W + vw] = rmask & (rmask - 1ULL);
-                adj_L[next_u * W + (v >> 6)] &= ~(1ULL << (v & 63));
+                // Clear (next_u, v) in adj_R (BLSR) and summary_R
+                uint64_t new_rmask = rmask & (rmask - 1ULL);
+                adj_R[v * W + vw] = new_rmask;
+                if (new_rmask == 0ULL) {
+                    summary_R[v] = sum_v & (sum_v - 1ULL);
+                }
+
+                // Clear (next_u, v) in adj_L and summary_L
+                int v_word = v >> 6;
+                uint64_t new_lmask_next = adj_L[next_u * W + v_word] & ~(1ULL << (v & 63));
+                adj_L[next_u * W + v_word] = new_lmask_next;
+                if (new_lmask_next == 0ULL) {
+                    summary_L[next_u] &= ~(1ULL << v_word);
+                }
 
                 u = next_u;
                 if (u == root) break;
@@ -115,6 +122,100 @@ bool euler_split_sequential_ws(
     return false;
 }
 
+namespace {
+
+void extract_degree2_leaves(
+    const std::vector<WeightedEdge>& edges,
+    int n,
+    EulerWorkspace& ws,
+    ScheduleLeaf& leaf0,
+    ScheduleLeaf& leaf1
+) {
+    leaf0.weight = 1;
+    leaf1.weight = 1;
+    leaf0.perm.assign(n, -1);
+    leaf1.perm.assign(n, -1);
+
+    int* __restrict p0 = leaf0.perm.data();
+    int* __restrict p1 = leaf1.perm.data();
+
+    const int W = ws.num_words;
+    uint64_t* __restrict adj_L = ws.adj_L.data();
+    uint64_t* __restrict adj_R = ws.adj_R.data();
+    uint64_t* __restrict summary_L = ws.summary_L.data();
+    uint64_t* __restrict summary_R = ws.summary_R.data();
+
+    int E = 0;
+    for (const auto& e : edges) {
+        if (e.w == 2) {
+            p0[e.u] = e.v;
+            p1[e.u] = e.v;
+        } else if (e.w == 1) {
+            int uw = e.v >> 6;
+            int vw = e.u >> 6;
+            adj_L[e.u * W + uw] |= (1ULL << (e.v & 63));
+            adj_R[e.v * W + vw] |= (1ULL << (e.u & 63));
+            summary_L[e.u] |= (1ULL << uw);
+            summary_R[e.v] |= (1ULL << vw);
+            ++E;
+        }
+    }
+
+    if (E == 0) return;
+
+    for (int root = 0; root < n; ++root) {
+        while (summary_L[root] != 0ULL) {
+            int u = root;
+            while (summary_L[u] != 0ULL) {
+                uint64_t sum_u = summary_L[u];
+                int uw = __builtin_ctzll(sum_u);
+                uint64_t lmask = adj_L[u * W + uw];
+                int v_bit = __builtin_ctzll(lmask);
+                int v = (uw << 6) + v_bit;
+
+                uint64_t new_lmask = lmask & (lmask - 1ULL);
+                adj_L[u * W + uw] = new_lmask;
+                if (new_lmask == 0ULL) {
+                    summary_L[u] = sum_u & (sum_u - 1ULL);
+                }
+
+                int u_word = u >> 6;
+                uint64_t new_rmask_u = adj_R[v * W + u_word] & ~(1ULL << (u & 63));
+                adj_R[v * W + u_word] = new_rmask_u;
+                if (new_rmask_u == 0ULL) {
+                    summary_R[v] &= ~(1ULL << u_word);
+                }
+                p0[u] = v; // Direct write to Leaf 0 (Red permutation)
+
+                uint64_t sum_v = summary_R[v];
+                int vw = __builtin_ctzll(sum_v);
+                uint64_t rmask = adj_R[v * W + vw];
+                int u_bit = __builtin_ctzll(rmask);
+                int next_u = (vw << 6) + u_bit;
+
+                uint64_t new_rmask = rmask & (rmask - 1ULL);
+                adj_R[v * W + vw] = new_rmask;
+                if (new_rmask == 0ULL) {
+                    summary_R[v] = sum_v & (sum_v - 1ULL);
+                }
+
+                int v_word = v >> 6;
+                uint64_t new_lmask_next = adj_L[next_u * W + v_word] & ~(1ULL << (v & 63));
+                adj_L[next_u * W + v_word] = new_lmask_next;
+                if (new_lmask_next == 0ULL) {
+                    summary_L[next_u] &= ~(1ULL << v_word);
+                }
+                p1[next_u] = v; // Direct write to Leaf 1 (Blue permutation)
+
+                u = next_u;
+                if (u == root) break;
+            }
+        }
+    }
+}
+
+} // namespace
+
 void decompose_recursive_seq_ws(
     const std::vector<WeightedEdge>& edges,
     int n,
@@ -124,6 +225,12 @@ void decompose_recursive_seq_ws(
     EulerWorkspace& ws,
     std::vector<ScheduleLeaf>& out_leaves
 ) {
+    if (degree == 2) {
+        extract_degree2_leaves(
+            edges, n, ws, out_leaves[leaf_offset], out_leaves[leaf_offset + 1]
+        );
+        return;
+    }
     if (degree == 1) {
         ScheduleLeaf& leaf = out_leaves[leaf_offset];
         leaf.weight = 1;

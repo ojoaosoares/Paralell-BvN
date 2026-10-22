@@ -43,12 +43,16 @@ struct FlatEdge {
 };
 
 /**
- * Weighted edge entry (u -> v with multiplicity w)
+ * Weighted edge entry (u -> v with multiplicity w), packed into 8 bytes (single 64-bit register)
  */
-struct WeightedEdge {
-    int u;
-    int v;
-    int w;
+struct alignas(8) WeightedEdge {
+    uint16_t u;
+    uint16_t v;
+    int32_t w;
+
+    WeightedEdge() = default;
+    constexpr WeightedEdge(int u_, int v_, int w_)
+        : u(static_cast<uint16_t>(u_)), v(static_cast<uint16_t>(v_)), w(w_) {}
 };
 
 /**

@@ -15,11 +15,11 @@ constexpr int kMaxRecursionDepth = 20;
  */
 struct EulerWorkspace {
     int num_words = 0;
-    std::vector<uint64_t> adj_L;      // Bitmask adjacency for Left vertices (N * num_words)
-    std::vector<uint64_t> adj_R;      // Bitmask adjacency for Right vertices (N * num_words)
+    std::vector<uint64_t> adj_L;      // Level-1 Bitmask adjacency for Left vertices (N * num_words)
+    std::vector<uint64_t> adj_R;      // Level-1 Bitmask adjacency for Right vertices (N * num_words)
+    std::vector<uint64_t> summary_L;  // Level-0 Summary Bitmask of non-zero words for Left vertices (size N)
+    std::vector<uint64_t> summary_R;  // Level-0 Summary Bitmask of non-zero words for Right vertices (size N)
     std::vector<uint64_t> red_mask;   // Bitmask of odd edges colored Red (N * num_words)
-    std::vector<int> word_head_L;     // Active 64-bit word cursor for Left vertices (size N)
-    std::vector<int> word_head_R;     // Active 64-bit word cursor for Right vertices (size N)
     std::vector<WeightedEdge> level_red[kMaxRecursionDepth];
     std::vector<WeightedEdge> level_blue[kMaxRecursionDepth];
 
@@ -29,9 +29,9 @@ struct EulerWorkspace {
         const size_t mask_size = static_cast<size_t>(n) * num_words;
         if (adj_L.size() < mask_size) adj_L.assign(mask_size, 0ULL);
         if (adj_R.size() < mask_size) adj_R.assign(mask_size, 0ULL);
+        if (summary_L.size() < static_cast<size_t>(n)) summary_L.assign(n, 0ULL);
+        if (summary_R.size() < static_cast<size_t>(n)) summary_R.assign(n, 0ULL);
         if (red_mask.size() < mask_size) red_mask.assign(mask_size, 0ULL);
-        if (static_cast<int>(word_head_L.size()) < n) word_head_L.resize(n, 0);
-        if (static_cast<int>(word_head_R.size()) < n) word_head_R.resize(n, 0);
 
         int d = 0;
         for (int cur_deg = max_level_deg; cur_deg > 1 && d < kMaxRecursionDepth; cur_deg >>= 1, ++d) {
