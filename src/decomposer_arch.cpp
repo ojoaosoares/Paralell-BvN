@@ -505,11 +505,25 @@ std::vector<ScheduleLeaf> run_block_bvn_pipeline(
 
     double t1 = omp_get_wtime();
 
-    // Phase 2 & 3: Embarrassingly parallel L1-resident Bitmask Eulerian BvN on all K^2 blocks
-    // followed by conflict-free diagonal block fusion into global N-port ScheduleLeaf permutations
+    // Allocate per-block internal task node buffers so heavy hotspot blocks (db > target_degree / K, e.g. bursty/skewed)
+    // automatically spawn OpenMP tasks (`decompose_recursive_omp_arch`) for work-stealing by idle threads,
+    // while balanced uniform blocks (db <= target_degree / K) run with zero task overhead in L1 cache!
+    const int block_cutoff = std::max(cfg.cutoff_degree, std::max(256, cfg.target_degree / K));
+    static std::vector<std::vector<std::vector<WeightedEdge>>> block_node_buffers;
+    if (static_cast<int>(block_node_buffers.size()) < num_blocks) {
+        block_node_buffers.resize(num_blocks);
+    }
     for (int b_idx = 0; b_idx < num_blocks; ++b_idx) {
-        if (static_cast<int>(block_leaves[b_idx].size()) < block_deg[b_idx]) {
-            block_leaves[b_idx].resize(block_deg[b_idx]);
+        int db = block_deg[b_idx];
+        if (static_cast<int>(block_leaves[b_idx].size()) < db) {
+            block_leaves[b_idx].resize(db);
+        }
+        if (db > block_cutoff) {
+            int num_internal = std::max(2, db / block_cutoff);
+            int total_nodes = 2 * num_internal + 1;
+            if (static_cast<int>(block_node_buffers[b_idx].size()) < total_nodes) {
+                block_node_buffers[b_idx].resize(total_nodes);
+            }
         }
     }
 
@@ -519,16 +533,23 @@ std::vector<ScheduleLeaf> run_block_bvn_pipeline(
     {
         EulerWorkspace& tls_ws = get_thread_workspace();
 
-        // Step A: Decompose each non-empty N_b x N_b block independently in L1 cache
-        // and immediately filter out local phantom padding while the N_b x N_b sub-matrix is hot in L1/L2!
+        // Step A: Decompose each non-empty N_b x N_b block in L1 cache.
+        // Heavy blocks (db > block_cutoff) automatically use OpenMP Task work-stealing (decompose_recursive_omp_arch)!
         #pragma omp for schedule(dynamic, 1)
         for (int b_idx = 0; b_idx < num_blocks; ++b_idx) {
             int db = block_deg[b_idx];
             if (db == 0) continue;
             const auto& edges = block_edges[b_idx];
-            tls_ws.ensure_capacity(nb, db, db, static_cast<int>(edges.size()));
             auto& b_leaves = block_leaves[b_idx];
-            decompose_recursive_seq_ws(edges, nb, db, 0, 0, tls_ws, b_leaves);
+
+            if (db > block_cutoff) {
+                decompose_recursive_omp_arch(
+                    edges, nb, db, 0, block_cutoff, 0, 0, block_node_buffers[b_idx], b_leaves
+                );
+            } else {
+                tls_ws.ensure_capacity(nb, db, db, static_cast<int>(edges.size()));
+                decompose_recursive_seq_ws(edges, nb, db, 0, 0, tls_ws, b_leaves);
+            }
 
             // Local L1-resident phantom traffic cleanup for block b_idx:
             // Compare only against the real demand of this N_b x N_b block (only db leaves instead of sum of K shifts!)
