@@ -104,12 +104,18 @@ int main(int argc, char** argv) {
     // 0. Generate chaotic traffic matrix M
     std::vector<int> demand_matrix = bvn::generate_traffic_matrix(cfg, stats.total_real_packets);
 
-    // Warm up OpenMP thread pool so OS pthread creation is not charged to Phase 1
+    // Warm up OpenMP thread pool and thread-local workspaces so OS pthread/mmap page faults do not skew timers
     if (cfg.mode != bvn::ExecMode::SEQ) {
         #pragma omp parallel num_threads(cfg.num_threads)
         {
-            asm volatile("" ::: "memory");
+            bvn::get_thread_workspace().ensure_capacity(
+                cfg.n, cfg.target_degree >> 1, cfg.cutoff_degree, cfg.n * cfg.n
+            );
         }
+    } else {
+        bvn::get_thread_workspace().ensure_capacity(
+            cfg.n, cfg.target_degree, cfg.target_degree, cfg.n * cfg.n
+        );
     }
 
     // 1. Phase 1: Regularization (Padding)

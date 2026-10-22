@@ -152,33 +152,37 @@ void decompose_recursive_omp_arch(
     int degree,
     int depth,
     int cutoff_degree,
-    int num_threads,
     int leaf_offset,
     std::vector<ScheduleLeaf>& out_leaves
 ) {
+    EulerWorkspace& tls_ws = get_thread_workspace();
+    tls_ws.ensure_capacity(n, degree, cutoff_degree, static_cast<int>(edges.size()));
+
     if (degree <= cutoff_degree || degree == 1) {
-        decompose_recursive_seq(edges, n, degree, leaf_offset, out_leaves);
+        decompose_recursive_seq_ws(edges, n, degree, 0, leaf_offset, tls_ws, out_leaves);
         return;
     }
 
     std::vector<WeightedEdge> red_edges;
     std::vector<WeightedEdge> blue_edges;
+    red_edges.reserve(edges.size());
+    blue_edges.reserve(edges.size());
 
-    // Subtrees at depth >= 1 are completely disjoint in memory: split without atomic lock instructions
-    euler_split_sequential(edges, n, red_edges, blue_edges);
+    // Subtrees at depth >= 1 use thread-local pre-allocated workspace (zero CSR heap allocations, zero atomics)
+    euler_split_sequential_ws(edges, n, tls_ws, red_edges, blue_edges);
 
     int half_deg = degree >> 1;
 
-    #pragma omp task shared(out_leaves, red_edges) firstprivate(n, half_deg, depth, cutoff_degree, num_threads, leaf_offset)
+    #pragma omp task shared(out_leaves, red_edges) firstprivate(n, half_deg, depth, cutoff_degree, leaf_offset)
     {
         decompose_recursive_omp_arch(
-            red_edges, n, half_deg, depth + 1, cutoff_degree, num_threads, leaf_offset, out_leaves
+            red_edges, n, half_deg, depth + 1, cutoff_degree, leaf_offset, out_leaves
         );
     }
 
     // Execute right branch directly on the current thread to halve task creation overhead and preserve L1/L2 locality
     decompose_recursive_omp_arch(
-        blue_edges, n, half_deg, depth + 1, cutoff_degree, num_threads, leaf_offset + half_deg, out_leaves
+        blue_edges, n, half_deg, depth + 1, cutoff_degree, leaf_offset + half_deg, out_leaves
     );
 
     #pragma omp taskwait
@@ -206,7 +210,9 @@ std::vector<ScheduleLeaf> decompose_omp_arch(
     }
 
     if (degree <= cfg.cutoff_degree || degree == 1) {
-        decompose_recursive_seq(initial_edges, n, degree, 0, leaves);
+        EulerWorkspace& tls_ws = get_thread_workspace();
+        tls_ws.ensure_capacity(n, degree, degree, static_cast<int>(initial_edges.size()));
+        decompose_recursive_seq_ws(initial_edges, n, degree, 0, 0, tls_ws, leaves);
     } else {
         // Root level (Depth 0): parallel walk with alignas(64) cursors across all threads
         std::vector<WeightedEdge> red_edges;
@@ -221,11 +227,11 @@ std::vector<ScheduleLeaf> decompose_omp_arch(
                 #pragma omp task shared(leaves, red_edges) firstprivate(n, half_deg)
                 {
                     decompose_recursive_omp_arch(
-                        red_edges, n, half_deg, 1, cfg.cutoff_degree, cfg.num_threads, 0, leaves
+                        red_edges, n, half_deg, 1, cfg.cutoff_degree, 0, leaves
                     );
                 }
                 decompose_recursive_omp_arch(
-                    blue_edges, n, half_deg, 1, cfg.cutoff_degree, cfg.num_threads, half_deg, leaves
+                    blue_edges, n, half_deg, 1, cfg.cutoff_degree, half_deg, leaves
                 );
                 #pragma omp taskwait
             }

@@ -1,16 +1,20 @@
 #include "bvn/decomposer.hpp"
+#include <algorithm>
 #include <cstdint>
 #include <vector>
 
 namespace bvn {
 
-void euler_split_sequential(
+void euler_split_sequential_ws(
     const std::vector<WeightedEdge>& edges,
     int n,
+    EulerWorkspace& ws,
     std::vector<WeightedEdge>& out_red,
     std::vector<WeightedEdge>& out_blue
 ) {
-    std::vector<int> deg(2 * n, 0);
+    int* deg = ws.deg.data();
+    std::fill(deg, deg + 2 * n, 0);
+
     int E = 0;
     for (const auto& e : edges) {
         if (e.w & 1) {
@@ -20,16 +24,20 @@ void euler_split_sequential(
         }
     }
 
-    std::vector<uint8_t> odd_color(E, 0);
+    uint8_t* odd_color = ws.odd_color.data();
 
     if (E > 0) {
-        std::vector<int> row_ptr(2 * n + 1, 0);
+        int* row_ptr = ws.row_ptr.data();
+        int* fill_ptr = ws.fill_ptr.data();
+        int* head = ws.head.data();
+        row_ptr[0] = 0;
         for (int i = 0; i < 2 * n; ++i) {
             row_ptr[i + 1] = row_ptr[i] + deg[i];
+            fill_ptr[i] = row_ptr[i];
+            head[i] = row_ptr[i];
         }
 
-        std::vector<FlatEdge> adj(2 * E);
-        std::vector<int> fill_ptr(row_ptr.begin(), row_ptr.begin() + 2 * n);
+        FlatEdge* adj = ws.adj.data();
         int odd_id = 0;
         for (const auto& e : edges) {
             if (e.w & 1) {
@@ -41,8 +49,8 @@ void euler_split_sequential(
             }
         }
 
-        std::vector<int> head(row_ptr.begin(), row_ptr.begin() + 2 * n);
-        std::vector<uint8_t> used(E, 0);
+        uint8_t* used = ws.used.data();
+        std::fill(used, used + E, 0);
 
         for (int root = 0; root < n; ++root) {
             while (head[root] < row_ptr[root + 1]) {
@@ -72,8 +80,6 @@ void euler_split_sequential(
 
     out_red.clear();
     out_blue.clear();
-    out_red.reserve(edges.size());
-    out_blue.reserve(edges.size());
 
     int odd_id = 0;
     for (const auto& e : edges) {
@@ -93,11 +99,13 @@ void euler_split_sequential(
     }
 }
 
-void decompose_recursive_seq(
+void decompose_recursive_seq_ws(
     const std::vector<WeightedEdge>& edges,
     int n,
     int degree,
+    int depth,
     int leaf_offset,
+    EulerWorkspace& ws,
     std::vector<ScheduleLeaf>& out_leaves
 ) {
     if (degree == 1) {
@@ -112,13 +120,18 @@ void decompose_recursive_seq(
         return;
     }
 
-    std::vector<WeightedEdge> red_edges;
-    std::vector<WeightedEdge> blue_edges;
-    euler_split_sequential(edges, n, red_edges, blue_edges);
+    auto& red_edges = ws.level_red[depth];
+    auto& blue_edges = ws.level_blue[depth];
+    euler_split_sequential_ws(edges, n, ws, red_edges, blue_edges);
 
     int half_deg = degree >> 1;
-    decompose_recursive_seq(red_edges, n, half_deg, leaf_offset, out_leaves);
-    decompose_recursive_seq(blue_edges, n, half_deg, leaf_offset + half_deg, out_leaves);
+    decompose_recursive_seq_ws(red_edges, n, half_deg, depth + 1, leaf_offset, ws, out_leaves);
+    decompose_recursive_seq_ws(blue_edges, n, half_deg, depth + 1, leaf_offset + half_deg, ws, out_leaves);
+}
+
+EulerWorkspace& get_thread_workspace() {
+    static thread_local EulerWorkspace tls_ws;
+    return tls_ws;
 }
 
 std::vector<ScheduleLeaf> decompose_seq(
@@ -139,7 +152,10 @@ std::vector<ScheduleLeaf> decompose_seq(
         }
     }
 
-    decompose_recursive_seq(initial_edges, n, degree, 0, leaves);
+    EulerWorkspace& ws = get_thread_workspace();
+    ws.ensure_capacity(n, degree, degree, static_cast<int>(initial_edges.size()));
+
+    decompose_recursive_seq_ws(initial_edges, n, degree, 0, 0, ws, leaves);
     return leaves;
 }
 
