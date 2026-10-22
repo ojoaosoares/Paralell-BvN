@@ -1,6 +1,7 @@
 #pragma once
 
 #include "bvn/types.hpp"
+#include <algorithm>
 #include <cstdint>
 #include <vector>
 
@@ -9,29 +10,29 @@ namespace bvn {
 constexpr int kMaxRecursionDepth = 20;
 
 /**
- * Pre-allocated per-thread scratchpad workspace to eliminate dynamic heap allocations
- * (malloc/free contention and page faults) across the recursion tree.
+ * Pre-allocated per-thread scratchpad workspace using 64-bit Bitmask Adjacency + Hardware TZCNT/BLSR
+ * to eliminate dynamic heap allocations and pointer/index chasing across the recursion tree.
  */
 struct EulerWorkspace {
-    std::vector<int> deg;
-    std::vector<uint8_t> odd_color;
-    std::vector<int> row_ptr;
-    std::vector<FlatEdge> adj;
-    std::vector<int> fill_ptr;
-    std::vector<int> head;
-    std::vector<uint8_t> used;
+    int num_words = 0;
+    std::vector<uint64_t> adj_L;      // Bitmask adjacency for Left vertices (N * num_words)
+    std::vector<uint64_t> adj_R;      // Bitmask adjacency for Right vertices (N * num_words)
+    std::vector<uint64_t> red_mask;   // Bitmask of odd edges colored Red (N * num_words)
+    std::vector<int> word_head_L;     // Active 64-bit word cursor for Left vertices (size N)
+    std::vector<int> word_head_R;     // Active 64-bit word cursor for Right vertices (size N)
     std::vector<WeightedEdge> level_red[kMaxRecursionDepth];
     std::vector<WeightedEdge> level_blue[kMaxRecursionDepth];
 
     void ensure_capacity(int n, int max_csr_deg, int max_level_deg, int max_edges) {
-        int sub_max = std::min(max_edges, n * max_csr_deg);
-        if (static_cast<int>(deg.size()) < 2 * n) deg.resize(2 * n, 0);
-        if (static_cast<int>(odd_color.size()) < sub_max) odd_color.resize(sub_max);
-        if (static_cast<int>(row_ptr.size()) < 2 * n + 1) row_ptr.resize(2 * n + 1);
-        if (static_cast<int>(adj.size()) < 2 * sub_max) adj.resize(2 * sub_max);
-        if (static_cast<int>(fill_ptr.size()) < 2 * n) fill_ptr.resize(2 * n);
-        if (static_cast<int>(head.size()) < 2 * n) head.resize(2 * n);
-        if (static_cast<int>(used.size()) < sub_max) used.resize(sub_max);
+        (void)max_csr_deg;
+        num_words = (n + 63) >> 6;
+        const size_t mask_size = static_cast<size_t>(n) * num_words;
+        if (adj_L.size() < mask_size) adj_L.assign(mask_size, 0ULL);
+        if (adj_R.size() < mask_size) adj_R.assign(mask_size, 0ULL);
+        if (red_mask.size() < mask_size) red_mask.assign(mask_size, 0ULL);
+        if (static_cast<int>(word_head_L.size()) < n) word_head_L.resize(n, 0);
+        if (static_cast<int>(word_head_R.size()) < n) word_head_R.resize(n, 0);
+
         int d = 0;
         for (int cur_deg = max_level_deg; cur_deg > 1 && d < kMaxRecursionDepth; cur_deg >>= 1, ++d) {
             size_t cap = static_cast<size_t>(std::min(max_edges, n * (cur_deg >> 1)));
@@ -47,7 +48,7 @@ struct EulerWorkspace {
 EulerWorkspace& get_thread_workspace();
 
 /**
- * Sequential Eulerian split using a pre-allocated workspace (zero heap allocations for CSR buffers).
+ * Bitmask + TZCNT/BLSR Eulerian split using a pre-allocated workspace.
  * Returns true if the split is 100% symmetric (E_odd == 0, so Red and Blue subgraphs are identical).
  */
 bool euler_split_sequential_ws(
@@ -92,7 +93,7 @@ std::vector<ScheduleLeaf> decompose_omp_naive(
 
 /**
  * Architecture-Aware OpenMP Eulerian BvN Decomposition
- * (alignas(64) cursors, parity pre-halving, Thread-Local Workspace, calibrated task cut-off).
+ * (alignas(64) cursors, parity pre-halving, Bitmask TZCNT Workspace, calibrated task cut-off).
  */
 std::vector<ScheduleLeaf> decompose_omp_arch(
     const std::vector<int>& regularized_matrix,

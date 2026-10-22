@@ -12,14 +12,16 @@ bool euler_split_sequential_ws(
     std::vector<WeightedEdge>& out_red,
     std::vector<WeightedEdge>& out_blue
 ) {
-    int* deg = ws.deg.data();
-    std::fill(deg, deg + 2 * n, 0);
+    const int W = ws.num_words;
+    uint64_t* __restrict adj_L = ws.adj_L.data();
+    uint64_t* __restrict adj_R = ws.adj_R.data();
+    uint64_t* __restrict red_mask = ws.red_mask.data();
 
     int E = 0;
     for (const auto& e : edges) {
         if (e.w & 1) {
-            deg[e.u]++;
-            deg[n + e.v]++;
+            adj_L[e.u * W + (e.v >> 6)] |= (1ULL << (e.v & 63));
+            adj_R[e.v * W + (e.u >> 6)] |= (1ULL << (e.u & 63));
             ++E;
         }
     }
@@ -34,54 +36,58 @@ bool euler_split_sequential_ws(
         return true;
     }
 
-    uint8_t* odd_color = ws.odd_color.data();
+    int* __restrict head_L = ws.word_head_L.data();
+    int* __restrict head_R = ws.word_head_R.data();
+    std::fill(head_L, head_L + n, 0);
+    std::fill(head_R, head_R + n, 0);
 
-    int* row_ptr = ws.row_ptr.data();
-    int* fill_ptr = ws.fill_ptr.data();
-    int* head = ws.head.data();
-    row_ptr[0] = 0;
-    for (int i = 0; i < 2 * n; ++i) {
-        row_ptr[i + 1] = row_ptr[i] + deg[i];
-        fill_ptr[i] = row_ptr[i];
-        head[i] = row_ptr[i];
-    }
-
-    FlatEdge* adj = ws.adj.data();
-    int odd_id = 0;
-    for (const auto& e : edges) {
-        if (e.w & 1) {
-            int u = e.u;
-            int v = n + e.v;
-            adj[fill_ptr[u]++] = {v, odd_id};
-            adj[fill_ptr[v]++] = {u, odd_id};
-            ++odd_id;
-        }
-    }
-
-    uint8_t* used = ws.used.data();
-    std::fill(used, used + E, 0);
-
+    // Branchless 2-step (L -> R -> L) Eulerian cycle walk using hardware TZCNT (__builtin_ctzll) and BLSR
     for (int root = 0; root < n; ++root) {
-        while (head[root] < row_ptr[root + 1]) {
-            int curr = root;
-            uint8_t color = 0;
+        while (true) {
+            int w = head_L[root];
+            while (w < W && adj_L[root * W + w] == 0ULL) {
+                ++w;
+            }
+            head_L[root] = w;
+            if (w >= W) break;
+
+            int u = root;
             while (true) {
-                int chosen_id = -1;
-                int next_v = -1;
-                while (head[curr] < row_ptr[curr + 1]) {
-                    const FlatEdge& fe = adj[head[curr]++];
-                    if (!used[fe.edge_id]) {
-                        used[fe.edge_id] = 1;
-                        chosen_id = fe.edge_id;
-                        next_v = fe.to;
-                        break;
-                    }
+                // Step 1: L -> R (u -> v), colored Red
+                int uw = head_L[u];
+                while (uw < W && adj_L[u * W + uw] == 0ULL) {
+                    ++uw;
                 }
-                if (chosen_id == -1) break;
-                odd_color[chosen_id] = color;
-                color ^= 1;
-                curr = next_v;
-                if (curr == root) break;
+                head_L[u] = uw;
+                if (uw >= W) break;
+
+                uint64_t lmask = adj_L[u * W + uw];
+                int v_bit = __builtin_ctzll(lmask);
+                int v = (uw << 6) + v_bit;
+
+                // Clear (u, v) in adj_L (BLSR) and adj_R, and mark (u, v) in red_mask
+                adj_L[u * W + uw] = lmask & (lmask - 1ULL);
+                adj_R[v * W + (u >> 6)] &= ~(1ULL << (u & 63));
+                red_mask[u * W + uw] |= (1ULL << v_bit);
+
+                // Step 2: R -> L (v -> next_u), colored Blue
+                // Since every vertex in R has even degree, v is guaranteed to have an outgoing edge!
+                int vw = head_R[v];
+                while (adj_R[v * W + vw] == 0ULL) {
+                    ++vw;
+                }
+                head_R[v] = vw;
+
+                uint64_t rmask = adj_R[v * W + vw];
+                int u_bit = __builtin_ctzll(rmask);
+                int next_u = (vw << 6) + u_bit;
+
+                // Clear (next_u, v) in adj_R (BLSR) and adj_L
+                adj_R[v * W + vw] = rmask & (rmask - 1ULL);
+                adj_L[next_u * W + (v >> 6)] &= ~(1ULL << (v & 63));
+
+                u = next_u;
+                if (u == root) break;
             }
         }
     }
@@ -89,18 +95,19 @@ bool euler_split_sequential_ws(
     out_red.clear();
     out_blue.clear();
 
-    odd_id = 0;
     for (const auto& e : edges) {
         int half = e.w >> 1;
         int w_red = half;
         int w_blue = half;
         if (e.w & 1) {
-            if (odd_color[odd_id] == 0) {
+            uint64_t& rword = red_mask[e.u * W + (e.v >> 6)];
+            uint64_t bit = 1ULL << (e.v & 63);
+            if (rword & bit) {
                 ++w_red;
+                rword &= ~bit; // Leaves red_mask 100% zeroed for next call without memset!
             } else {
                 ++w_blue;
             }
-            ++odd_id;
         }
         if (w_red > 0) out_red.push_back({e.u, e.v, w_red});
         if (w_blue > 0) out_blue.push_back({e.u, e.v, w_blue});
