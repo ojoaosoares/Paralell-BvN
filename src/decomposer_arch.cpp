@@ -49,8 +49,13 @@ bool euler_root_split_omp_arch(
     double t_after_bitmask = t_start;
     double t_after_walk = t_start;
 
-    #pragma omp parallel num_threads(num_threads) reduction(+:total_odd_edges)
+    // total_odd_edges is shared (not a reduction variable): every thread must see the same
+    // global count before branching into worksharing constructs, otherwise threads that own
+    // no rows (num_threads > n / 64) skip an `omp for` the others enter and the team deadlocks.
+    #pragma omp parallel num_threads(num_threads)
     {
+        int local_odd_edges = 0;
+
         // Step 1: Parallel Bitmask Construction
         #pragma omp for schedule(static, 64)
         for (int u = 0; u < n; ++u) {
@@ -67,11 +72,15 @@ bool euler_root_split_omp_arch(
                     l_row[uw] |= (1ULL << (v & 63));
                     sum_u |= (1ULL << uw);
                     adj_R[v * W + u_word] |= u_bit;
-                    ++total_odd_edges;
+                    ++local_odd_edges;
                 }
             }
             summary_L[u] = sum_u;
         }
+
+        #pragma omp atomic
+        total_odd_edges += local_odd_edges;
+        #pragma omp barrier
 
         // Parallel construction of summary_R across vertices v in R (100% race-free per v)
         if (total_odd_edges > 0) {
