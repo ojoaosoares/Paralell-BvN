@@ -10,8 +10,24 @@ namespace bvn {
 namespace {
 
 /**
+ * In-place 64x64 bit-matrix transpose (Hacker's Delight, LSB = column 0):
+ * after the call, bit i of a[j] equals the former bit j of a[i]. 6 rounds of masked swaps.
+ */
+inline void transpose64(uint64_t* __restrict a) {
+    uint64_t m = 0x00000000FFFFFFFFULL;
+    for (int j = 32; j != 0; j >>= 1, m ^= (m << j)) {
+        for (int k = 0; k < 64; k = ((k | j) + 1) & ~j) {
+            const uint64_t t = ((a[k] >> j) ^ a[k | j]) & m;
+            a[k] ^= t << j;
+            a[k | j] ^= t;
+        }
+    }
+}
+
+/**
  * Root-level (Depth 0) Architecture-Aware Parallel Split directly from the N x N regularized matrix:
- * 1. Parallel lock-free 64-bit Bitmask construction using 64-row block partitioning (disjoint uint64_t words in adj_R).
+ * 1. Parallel 64-bit Bitmask construction: each thread fills its own adj_L rows, then adj_R is built as the
+ *    bit-transpose of adj_L in 64x64 tiles, each thread owning a slab of 64 adj_R rows (no shared cache lines).
  * 2. Hardware TZCNT (__builtin_ctzll) + BLSR 2-step (L -> R -> L) Eulerian cycle walk in L1/L2 cache.
  * 3. Parallel prefix-sum construction of red_edges and blue_edges directly from the matrix (eliminating initial_edges).
  */
@@ -63,8 +79,6 @@ bool euler_root_split_omp_arch(
         for (int u = 0; u < n; ++u) {
             const int* __restrict row = &regularized_matrix[static_cast<size_t>(u) * n];
             uint64_t* __restrict l_row = &adj_L[u * W];
-            const int u_word = u >> 6;
-            const uint64_t u_bit = 1ULL << (u & 63);
             uint64_t sum_u = 0ULL;
 
             for (int v = 0; v < n; ++v) {
@@ -73,7 +87,6 @@ bool euler_root_split_omp_arch(
                     int uw = v >> 6;
                     l_row[uw] |= (1ULL << (v & 63));
                     sum_u |= (1ULL << uw);
-                    adj_R[v * W + u_word] |= u_bit;
                     ++local_odd_edges;
                 }
             }
@@ -84,18 +97,39 @@ bool euler_root_split_omp_arch(
         total_odd_edges += local_odd_edges;
         #pragma omp barrier
 
-        // Parallel construction of summary_R across vertices v in R (100% race-free per v)
+        // adj_R = transpose(adj_L), tile by tile. Scattering `adj_R[v * W + u_word] |= u_bit` from the
+        // row loop made up to 8 threads write neighbouring words of one cache line (false sharing);
+        // here the thread owning tile column V is the only writer of adj_R rows [64V, 64V + 64).
+        // adj_R is all-zero on entry (the previous walk cleared every bit), so empty tiles are skipped.
         if (total_odd_edges > 0) {
             #pragma omp for schedule(static)
-            for (int v = 0; v < n; ++v) {
-                const uint64_t* __restrict r_row = &adj_R[v * W];
-                uint64_t sum_v = 0ULL;
-                for (int w = 0; w < W; ++w) {
-                    if (r_row[w] != 0ULL) {
-                        sum_v |= (1ULL << w);
+            for (int V = 0; V < W; ++V) {
+                const int v_base = V << 6;
+                const int v_cnt = std::min(64, n - v_base);
+                uint64_t tile[64];
+                uint64_t sum_v[64] = {};
+                for (int U = 0; U < W; ++U) {
+                    const int u_base = U << 6;
+                    const int u_cnt = std::min(64, n - u_base);
+                    uint64_t any = 0ULL;
+                    for (int i = 0; i < u_cnt; ++i) {
+                        tile[i] = adj_L[(u_base + i) * W + V];
+                        any |= tile[i];
+                    }
+                    if (any == 0ULL) continue;
+                    for (int i = u_cnt; i < 64; ++i) {
+                        tile[i] = 0ULL;
+                    }
+                    transpose64(tile);
+                    const uint64_t u_word_bit = 1ULL << U;
+                    for (int i = 0; i < v_cnt; ++i) {
+                        adj_R[(v_base + i) * W + U] = tile[i];
+                        sum_v[i] |= (tile[i] != 0ULL) ? u_word_bit : 0ULL;
                     }
                 }
-                summary_R[v] = sum_v;
+                for (int i = 0; i < v_cnt; ++i) {
+                    summary_R[v_base + i] = sum_v[i];
+                }
             }
         }
 
