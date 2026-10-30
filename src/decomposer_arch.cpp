@@ -16,7 +16,7 @@ namespace {
  * 3. Parallel prefix-sum construction of red_edges and blue_edges directly from the matrix (eliminating initial_edges).
  */
 bool euler_root_split_omp_arch(
-    const std::vector<int>& regularized_matrix,
+    const Matrix& regularized_matrix,
     int n,
     int num_threads,
     std::vector<WeightedEdge>& out_red,
@@ -45,6 +45,8 @@ bool euler_root_split_omp_arch(
     std::vector<int> thread_red_offset(num_threads + 1, 0);
     std::vector<int> thread_blue_offset(num_threads + 1, 0);
 
+    const int row_chunk = matrix_row_chunk(n, num_threads);
+
     double t_start = omp_get_wtime();
     double t_after_bitmask = t_start;
     double t_after_walk = t_start;
@@ -57,7 +59,7 @@ bool euler_root_split_omp_arch(
         int local_odd_edges = 0;
 
         // Step 1: Parallel Bitmask Construction
-        #pragma omp for schedule(static, 64)
+        #pragma omp for schedule(static, row_chunk)
         for (int u = 0; u < n; ++u) {
             const int* __restrict row = &regularized_matrix[static_cast<size_t>(u) * n];
             uint64_t* __restrict l_row = &adj_L[u * W];
@@ -162,7 +164,7 @@ bool euler_root_split_omp_arch(
         local_blue.clear();
 
         if (total_odd_edges == 0) {
-            #pragma omp for schedule(static)
+            #pragma omp for schedule(static, row_chunk)
             for (int u = 0; u < n; ++u) {
                 const int* __restrict row = &regularized_matrix[static_cast<size_t>(u) * n];
                 for (int v = 0; v < n; ++v) {
@@ -173,7 +175,7 @@ bool euler_root_split_omp_arch(
                 }
             }
         } else {
-            #pragma omp for schedule(static)
+            #pragma omp for schedule(static, row_chunk)
             for (int u = 0; u < n; ++u) {
                 const int* __restrict row = &regularized_matrix[static_cast<size_t>(u) * n];
                 uint64_t* __restrict r_row = &red_mask[u * W];
@@ -340,7 +342,7 @@ void aggregate_thread_telemetry(int num_threads, double wall_ms, PipelineStats* 
 } // namespace
 
 std::vector<ScheduleLeaf> decompose_omp_arch(
-    const std::vector<int>& regularized_matrix,
+    const Matrix& regularized_matrix,
     int n,
     int degree,
     const Config& cfg,
@@ -432,7 +434,7 @@ int select_optimal_block_factor(
     int n,
     int num_threads,
     int requested_k,
-    const std::vector<int>* demand_matrix,
+    const Matrix* demand_matrix,
     int target_degree
 ) {
     if (requested_k > 0 && (n % requested_k == 0)) {
@@ -479,7 +481,7 @@ int select_optimal_block_factor(
 }
 
 std::vector<ScheduleLeaf> run_block_bvn_pipeline(
-    const std::vector<int>& demand_matrix,
+    const Matrix& demand_matrix,
     const Config& cfg,
     PipelineStats& stats,
     double& out_phase1_ms,

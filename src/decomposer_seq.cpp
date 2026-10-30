@@ -396,7 +396,7 @@ EulerWorkspace& get_thread_workspace() {
 }
 
 std::vector<ScheduleLeaf> decompose_seq(
-    const std::vector<int>& regularized_matrix,
+    const Matrix& regularized_matrix,
     int n,
     int degree
 ) {
@@ -421,7 +421,7 @@ std::vector<ScheduleLeaf> decompose_seq(
 }
 
 std::vector<ScheduleLeaf> decompose_bvn(
-    const std::vector<int>& regularized_matrix,
+    const Matrix& regularized_matrix,
     int n,
     int degree,
     const Config& cfg,

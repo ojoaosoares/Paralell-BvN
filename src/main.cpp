@@ -111,7 +111,7 @@ int main(int argc, char** argv) {
     bvn::PipelineStats stats;
 
     // 0. Generate chaotic traffic matrix M
-    std::vector<int> demand_matrix = bvn::generate_traffic_matrix(cfg, stats.total_real_packets);
+    bvn::Matrix demand_matrix = bvn::generate_traffic_matrix(cfg, stats.total_real_packets);
 
     // Warm up OpenMP thread pool and thread-local workspaces so OS pthread/mmap page faults do not skew timers
     if (cfg.mode == bvn::ExecMode::OMP_BLOCK) {
@@ -160,7 +160,7 @@ int main(int argc, char** argv) {
     } else {
         // 1. Phase 1: Regularization (Padding)
         double t0 = omp_get_wtime();
-        std::vector<int> reg_matrix = bvn::regularize_matrix(
+        bvn::Matrix reg_matrix = bvn::regularize_matrix(
             demand_matrix,
             cfg.n,
             cfg.target_degree,

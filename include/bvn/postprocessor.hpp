@@ -11,7 +11,7 @@ namespace bvn {
  * the original demand matrix M, replacing dummy connections with -1 (no-op).
  */
 void cleanup_phantom_traffic(
-    const std::vector<int>& original_demand_matrix,
+    const Matrix& original_demand_matrix,
     int n,
     ExecMode mode,
     std::vector<ScheduleLeaf>& schedules
@@ -23,7 +23,7 @@ void cleanup_phantom_traffic(
  * 2. Verifies the sum of all schedules equals the exact original traffic matrix M_ij.
  */
 bool verify_decomposition(
-    const std::vector<int>& original_demand_matrix,
+    const Matrix& original_demand_matrix,
     int n,
     const std::vector<ScheduleLeaf>& schedules
 );

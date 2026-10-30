@@ -159,7 +159,7 @@ void decompose_recursive_omp_naive(
 } // namespace
 
 std::vector<ScheduleLeaf> decompose_omp_naive(
-    const std::vector<int>& regularized_matrix,
+    const Matrix& regularized_matrix,
     int n,
     int degree,
     int num_threads

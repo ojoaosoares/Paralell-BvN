@@ -6,7 +6,7 @@
 namespace bvn {
 
 void cleanup_phantom_traffic(
-    const std::vector<int>& original_demand_matrix,
+    const Matrix& original_demand_matrix,
     int n,
     ExecMode mode,
     std::vector<ScheduleLeaf>& schedules
@@ -32,11 +32,13 @@ void cleanup_phantom_traffic(
             }
         }
     } else {
-        // Each input port u is independent: embarrassingly parallel across rows with L1-local state
+        // Each input port u is independent: embarrassingly parallel across rows with L1-local state.
+        // Same row slabs as the first-touch layout, so every thread reads node-local demand rows.
+        const int chunk = matrix_row_chunk(n, omp_get_max_threads());
         #pragma omp parallel
         {
             std::vector<int> rem_row(n, 0);
-            #pragma omp for schedule(static)
+            #pragma omp for schedule(static, chunk)
             for (int u = 0; u < n; ++u) {
                 const int* orig_row = &original_demand_matrix[static_cast<size_t>(u) * n];
                 for (int v = 0; v < n; ++v) {
@@ -58,7 +60,7 @@ void cleanup_phantom_traffic(
 }
 
 bool verify_decomposition(
-    const std::vector<int>& original_demand_matrix,
+    const Matrix& original_demand_matrix,
     int n,
     const std::vector<ScheduleLeaf>& schedules
 ) {
