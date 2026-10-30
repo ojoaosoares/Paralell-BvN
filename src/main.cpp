@@ -234,6 +234,12 @@ int main(int argc, char** argv) {
         stats.verified_ok = true;
     }
 
+    // Frame efficiency: fraction of the N x num_schedules port-slots carrying real traffic.
+    // Modes that inflate the frame (e.g. per-block power-of-2 padding) trade speed for throughput.
+    const double frame_efficiency = stats.num_schedules > 0
+        ? static_cast<double>(stats.total_real_packets) / (static_cast<double>(cfg.n) * stats.num_schedules)
+        : 0.0;
+
     if (cfg.csv_output) {
         std::cout << mode_to_str(cfg.mode) << ","
                   << pattern_to_str(cfg.pattern) << ","
@@ -246,6 +252,8 @@ int main(int argc, char** argv) {
                   << stats.phase2_3_euler_ms << ","
                   << stats.phase4_cleanup_ms << ","
                   << stats.total_ms << ","
+                  << stats.num_schedules << ","
+                  << std::setprecision(4) << frame_efficiency << ","
                   << (stats.verified_ok ? "PASS" : "FAIL") << "\n";
     } else {
         std::cout << "============================================================\n"
@@ -266,6 +274,8 @@ int main(int argc, char** argv) {
                   << " Task Cut-off Deg : " << cfg.cutoff_degree << "\n"
                   << " Real Packets     : " << stats.total_real_packets << "\n"
                   << " Phantom Padding  : " << stats.total_phantom_packets << "\n"
+                  << " Schedules (Frame): " << stats.num_schedules
+                  << " (efficiency " << std::fixed << std::setprecision(2) << (100.0 * frame_efficiency) << "%)\n"
                   << "------------------------------------------------------------\n"
                   << std::fixed << std::setprecision(3)
                   << " Phase 1 (Padding)          : " << std::setw(9) << stats.phase1_padding_ms << " ms\n"
