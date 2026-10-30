@@ -1,6 +1,8 @@
 #include "bvn/decomposer.hpp"
 #include <algorithm>
 #include <cstdint>
+#include <functional>
+#include <mutex>
 #include <vector>
 
 namespace bvn {
@@ -390,9 +392,38 @@ void decompose_recursive_seq_ws(
     }
 }
 
+namespace {
+
+std::mutex& workspace_registry_mutex() {
+    static std::mutex m;
+    return m;
+}
+
+std::vector<EulerWorkspace*>& workspace_registry() {
+    static std::vector<EulerWorkspace*> registry;
+    return registry;
+}
+
+} // namespace
+
 EulerWorkspace& get_thread_workspace() {
-    static thread_local EulerWorkspace tls_ws;
-    return tls_ws;
+    // Heap-allocated and never freed: nested OpenMP teams (--domains) run on pool threads that are
+    // not members of the top-level team, so telemetry walks this registry instead of a parallel
+    // region, and the pointers must stay valid even if the runtime retires a pool thread.
+    static thread_local EulerWorkspace* tls_ws = nullptr;
+    if (tls_ws == nullptr) {
+        tls_ws = new EulerWorkspace();
+        std::lock_guard<std::mutex> lock(workspace_registry_mutex());
+        workspace_registry().push_back(tls_ws);
+    }
+    return *tls_ws;
+}
+
+void for_each_thread_workspace(const std::function<void(EulerWorkspace&)>& fn) {
+    std::lock_guard<std::mutex> lock(workspace_registry_mutex());
+    for (EulerWorkspace* ws : workspace_registry()) {
+        fn(*ws);
+    }
 }
 
 std::vector<ScheduleLeaf> decompose_seq(

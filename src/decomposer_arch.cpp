@@ -2,6 +2,7 @@
 #include "bvn/regularizer.hpp"
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <omp.h>
 #include <vector>
 
@@ -333,14 +334,11 @@ void decompose_recursive_omp_arch(
 
 void aggregate_thread_telemetry(int num_threads, double wall_ms, PipelineStats* stats) {
     if (!stats) return;
-    std::vector<double> t_times(num_threads, 0.0);
+    std::vector<double> t_times;
     int64_t tot_splits = 0, tot_sym = 0, tot_unit = 0, tot_heavy = 0, tot_deg2 = 0, tot_scanned = 0, tot_walked = 0;
 
-    #pragma omp parallel num_threads(num_threads) reduction(+:tot_splits,tot_sym,tot_unit,tot_heavy,tot_deg2,tot_scanned,tot_walked)
-    {
-        int tid = omp_get_thread_num();
-        EulerWorkspace& ws = get_thread_workspace();
-        t_times[tid] = ws.active_time_ms;
+    for_each_thread_workspace([&](EulerWorkspace& ws) {
+        t_times.push_back(ws.active_time_ms);
         tot_splits += ws.splits;
         tot_sym += ws.sym_pruned;
         tot_unit += ws.unit_odd_fast;
@@ -348,7 +346,12 @@ void aggregate_thread_telemetry(int num_threads, double wall_ms, PipelineStats* 
         tot_deg2 += ws.deg2_calls;
         tot_scanned += ws.edges_scanned;
         tot_walked += ws.odd_edges_walked;
-    }
+    });
+
+    // The registry may hold more workspaces than the team (warm-up or nested-team pool threads):
+    // keep the num_threads busiest ones, padding with idle (0 ms) threads if fewer exist.
+    std::sort(t_times.begin(), t_times.end(), std::greater<double>());
+    t_times.resize(std::max(1, num_threads), 0.0);
 
     double t_min = t_times[0], t_max = t_times[0], t_sum = 0.0;
     for (int t = 0; t < num_threads; ++t) {
@@ -396,10 +399,7 @@ std::vector<ScheduleLeaf> decompose_omp_arch(
         node_buffers.resize(total_nodes);
     }
 
-    #pragma omp parallel num_threads(cfg.num_threads)
-    {
-        get_thread_workspace().reset_counters();
-    }
+    for_each_thread_workspace([](EulerWorkspace& ws) { ws.reset_counters(); });
 
     std::vector<WeightedEdge>& red_edges = node_buffers[1];
     std::vector<WeightedEdge>& blue_edges = node_buffers[2];
@@ -591,9 +591,10 @@ std::vector<ScheduleLeaf> run_block_bvn_pipeline(
     int64_t total_phantom = 0;
 
     // Phase 1: Single-pass parallel AVX2 SIMD + Adaptive Branchless sub-matrix extraction & local padding
+    for_each_thread_workspace([](EulerWorkspace& ws) { ws.reset_counters(); });
+
     #pragma omp parallel num_threads(cfg.num_threads) reduction(+:total_phantom)
     {
-        get_thread_workspace().reset_counters();
         static thread_local std::vector<int> row_sum;
         static thread_local std::vector<int> col_sum;
         if (static_cast<int>(row_sum.size()) < nb) row_sum.resize(nb);

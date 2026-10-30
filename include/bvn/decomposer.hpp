@@ -3,6 +3,7 @@
 #include "bvn/types.hpp"
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 namespace bvn {
@@ -73,6 +74,12 @@ struct EulerWorkspace {
  * Returns the calling thread's thread-local EulerWorkspace.
  */
 EulerWorkspace& get_thread_workspace();
+
+/**
+ * Visits every EulerWorkspace ever created (one per OS thread, including nested-team threads).
+ * Must not run concurrently with parallel regions that use the workspaces.
+ */
+void for_each_thread_workspace(const std::function<void(EulerWorkspace&)>& fn);
 
 /**
  * Bitmask + TZCNT/BLSR Eulerian split using a pre-allocated workspace.
