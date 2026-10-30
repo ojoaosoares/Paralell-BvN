@@ -24,6 +24,8 @@ void print_usage(const char* prog) {
               << "  --blocks <int>       Spatial block grid KxK for omp_block (0 = dynamic optimal)\n"
               << "  --mode <str>         Execution mode: seq | omp_naive | omp_arch | omp_block (default: omp_arch)\n"
               << "  --pattern <str>      Traffic pattern: uniform | skewed | bursty (default: uniform)\n"
+              << "  --domains <int>      Thread groups pinned to place partitions, e.g. sockets/CCXs\n"
+              << "                       (default: 1; 0 = one per OpenMP place, see OMP_PLACES)\n"
               << "  --seed <int>         RNG seed (default: 42)\n"
               << "  --metrics            Collect and print deep bottleneck telemetry\n"
               << "  --csv                Print single-line CSV output for benchmark scripts\n"
@@ -66,6 +68,8 @@ int main(int argc, char** argv) {
             cfg.cutoff_degree = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--blocks") == 0 && i + 1 < argc) {
             cfg.block_factor = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--domains") == 0 && i + 1 < argc) {
+            cfg.num_domains = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
             cfg.seed = static_cast<uint64_t>(std::atoll(argv[++i]));
         } else if (std::strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
@@ -271,6 +275,7 @@ int main(int argc, char** argv) {
         }
         std::cout << " Regular Degree D : " << stats.regularized_degree << "\n"
                   << " OpenMP Threads   : " << cfg.num_threads << "\n"
+                  << " Domain Groups    : " << cfg.num_domains << (cfg.num_domains == 0 ? " (auto: OpenMP places)" : "") << "\n"
                   << " Task Cut-off Deg : " << cfg.cutoff_degree << "\n"
                   << " Real Packets     : " << stats.total_real_packets << "\n"
                   << " Phantom Padding  : " << stats.total_phantom_packets << "\n"

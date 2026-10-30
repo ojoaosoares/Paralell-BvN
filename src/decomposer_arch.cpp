@@ -26,6 +26,54 @@ inline void transpose64(uint64_t* __restrict a) {
 }
 
 /**
+ * Number of thread groups for domain-confined execution (--domains G). G = 0 means one group per
+ * OpenMP place, so OMP_PLACES=numa_domains gives one group per NUMA node and OMP_PLACES=ll_caches
+ * one group per L3 slice (CCX/CCD). Clamped to [1, min(max_groups, num_threads)].
+ */
+int resolve_domains(const Config& cfg, int max_groups) {
+    int g = cfg.num_domains;
+    if (g <= 0) g = omp_get_num_places();
+    g = std::min({g, max_groups, cfg.num_threads});
+    return std::max(1, g);
+}
+
+/**
+ * Threads assigned to group g when num_threads are split across G groups.
+ */
+inline int group_threads(int num_threads, int G, int g) {
+    return num_threads / G + (g < num_threads % G ? 1 : 0);
+}
+
+/**
+ * Runs body(g, G) on G thread groups. G == 1: a plain team of num_threads (binding left to
+ * OMP_PROC_BIND). G > 1: an outer team of G threads with proc_bind(spread) splits the place list
+ * into G partitions, and each outer thread opens a nested team with proc_bind(close) confined to
+ * its partition (one NUMA node / L3 domain). body runs on every thread of the (inner) team and
+ * holds its own orphaned worksharing loops.
+ */
+template <class Body>
+void run_in_domain_groups(int G, int num_threads, Body&& body) {
+    if (G <= 1) {
+        #pragma omp parallel num_threads(num_threads)
+        {
+            body(0, 1);
+        }
+        return;
+    }
+    const int prev_levels = omp_get_max_active_levels();
+    omp_set_max_active_levels(std::max(prev_levels, 2));
+    #pragma omp parallel num_threads(G) proc_bind(spread)
+    {
+        const int g = omp_get_thread_num();
+        #pragma omp parallel num_threads(group_threads(num_threads, G, g)) proc_bind(close)
+        {
+            body(g, G);
+        }
+    }
+    omp_set_max_active_levels(prev_levels);
+}
+
+/**
  * Root-level (Depth 0) Architecture-Aware Parallel Split directly from the N x N regularized matrix:
  * 1. Parallel 64-bit Bitmask construction: each thread fills its own adj_L rows, then adj_R is built as the
  *    bit-transpose of adj_L in 64x64 tiles, each thread owning a slab of 64 adj_R rows (no shared cache lines).
@@ -410,34 +458,50 @@ std::vector<ScheduleLeaf> decompose_omp_arch(
 
     double t_tree_start = omp_get_wtime();
 
-    #pragma omp parallel num_threads(cfg.num_threads)
-    {
-        if (root_symmetric) {
+    // --domains: the two independent level-1 subtrees (Red / Blue, degree D/2) each run on their
+    // own nested team confined to one place partition (socket), so every buffer a subtree creates
+    // is first-touched and reused on that socket. Only 2 subtrees exist at level 1, so G <= 2.
+    const int G = root_symmetric ? 1 : resolve_domains(cfg, 2);
+    if (G == 2) {
+        run_in_domain_groups(G, cfg.num_threads, [&](int g, int) {
             #pragma omp single
             {
                 decompose_recursive_omp_arch(
-                    red_edges, n, half_deg, 1, cfg.cutoff_degree, 0, 1, node_buffers, leaves
+                    g == 0 ? red_edges : blue_edges, n, half_deg, 1, cfg.cutoff_degree,
+                    g * half_deg, 1 + g, node_buffers, leaves
                 );
             }
-            double tc = omp_get_wtime();
-            #pragma omp for schedule(static)
-            for (int i = 0; i < half_deg; ++i) {
-                leaves[half_deg + i] = leaves[i];
-            }
-            get_thread_workspace().active_time_ms += (omp_get_wtime() - tc) * 1000.0;
-        } else {
-            #pragma omp single nowait
-            {
-                #pragma omp task shared(leaves, node_buffers, red_edges) firstprivate(n, half_deg)
+        });
+    } else {
+        #pragma omp parallel num_threads(cfg.num_threads)
+        {
+            if (root_symmetric) {
+                #pragma omp single
                 {
                     decompose_recursive_omp_arch(
                         red_edges, n, half_deg, 1, cfg.cutoff_degree, 0, 1, node_buffers, leaves
                     );
                 }
-                decompose_recursive_omp_arch(
-                    blue_edges, n, half_deg, 1, cfg.cutoff_degree, half_deg, 2, node_buffers, leaves
-                );
-                #pragma omp taskwait
+                double tc = omp_get_wtime();
+                #pragma omp for schedule(static)
+                for (int i = 0; i < half_deg; ++i) {
+                    leaves[half_deg + i] = leaves[i];
+                }
+                get_thread_workspace().active_time_ms += (omp_get_wtime() - tc) * 1000.0;
+            } else {
+                #pragma omp single nowait
+                {
+                    #pragma omp task shared(leaves, node_buffers, red_edges) firstprivate(n, half_deg)
+                    {
+                        decompose_recursive_omp_arch(
+                            red_edges, n, half_deg, 1, cfg.cutoff_degree, 0, 1, node_buffers, leaves
+                        );
+                    }
+                    decompose_recursive_omp_arch(
+                        blue_edges, n, half_deg, 1, cfg.cutoff_degree, half_deg, 2, node_buffers, leaves
+                    );
+                    #pragma omp taskwait
+                }
             }
         }
     }
@@ -528,6 +592,15 @@ std::vector<ScheduleLeaf> run_block_bvn_pipeline(
     const int nb = n / K;
     const int num_blocks = K * K;
 
+    // --domains: shifts s (blocks b_idx = s * K + bi, whose leaves fuse into the same global
+    // schedules) are split into G contiguous ranges, one per domain group, so a shift's
+    // sub-matrices, leaves and fused schedules are produced and consumed in one NUMA node / L3.
+    const int G = resolve_domains(cfg, K);
+    auto shift_range = [K](int g, int groups, int& s_lo, int& s_hi) {
+        s_lo = (g * K) / groups;
+        s_hi = ((g + 1) * K) / groups;
+    };
+
     double t0 = omp_get_wtime();
 
     static std::vector<std::vector<WeightedEdge>> block_edges;
@@ -555,10 +628,13 @@ std::vector<ScheduleLeaf> run_block_bvn_pipeline(
         int db_max = next_pow2_int(target_D);
         int max_nodes = 2 * std::max(2, db_max / 32) + 1;
 
-        #pragma omp parallel num_threads(cfg.num_threads)
-        {
+        // Each group first-touches the buffers of the shifts it will own (see shift_range), and an
+        // equal slice of the global schedule pool (offsets grow ~linearly with the shift index).
+        run_in_domain_groups(G, cfg.num_threads, [&](int g, int groups) {
+            int s_lo, s_hi;
+            shift_range(g, groups, s_lo, s_hi);
             #pragma omp for schedule(static)
-            for (int b_idx = 0; b_idx < num_blocks; ++b_idx) {
+            for (int b_idx = s_lo * K; b_idx < s_hi * K; ++b_idx) {
                 block_edges[b_idx].resize(max_block_edges);
                 block_leaves[b_idx].resize(db_max);
                 for (auto& lf : block_leaves[b_idx]) {
@@ -573,14 +649,16 @@ std::vector<ScheduleLeaf> run_block_bvn_pipeline(
                     }
                 }
             }
+            const int p_lo = static_cast<int>((static_cast<int64_t>(g) * max_possible_sched) / groups);
+            const int p_hi = static_cast<int>((static_cast<int64_t>(g + 1) * max_possible_sched) / groups);
             #pragma omp for schedule(static)
-            for (int s = 0; s < max_possible_sched; ++s) {
+            for (int s = p_lo; s < p_hi; ++s) {
                 global_pool[s].weight = 1;
                 if (static_cast<int>(global_pool[s].perm.size()) != n) {
                     global_pool[s].perm.assign(n, -1);
                 }
             }
-        }
+        });
         out_phase1_ms = 0.0;
         out_phase2_3_ms = 0.0;
         return {};
@@ -593,8 +671,10 @@ std::vector<ScheduleLeaf> run_block_bvn_pipeline(
     // Phase 1: Single-pass parallel AVX2 SIMD + Adaptive Branchless sub-matrix extraction & local padding
     for_each_thread_workspace([](EulerWorkspace& ws) { ws.reset_counters(); });
 
-    #pragma omp parallel num_threads(cfg.num_threads) reduction(+:total_phantom)
-    {
+    run_in_domain_groups(G, cfg.num_threads, [&](int g, int groups) {
+        int s_lo, s_hi;
+        shift_range(g, groups, s_lo, s_hi);
+        int64_t local_phantom = 0;
         static thread_local std::vector<int> row_sum;
         static thread_local std::vector<int> col_sum;
         if (static_cast<int>(row_sum.size()) < nb) row_sum.resize(nb);
@@ -605,7 +685,7 @@ std::vector<ScheduleLeaf> run_block_bvn_pipeline(
         const size_t max_block_edges = static_cast<size_t>(nb) * std::min(nb, 256) + 2 * nb;
 
         #pragma omp for schedule(dynamic, 1)
-        for (int b_idx = 0; b_idx < num_blocks; ++b_idx) {
+        for (int b_idx = s_lo * K; b_idx < s_hi * K; ++b_idx) {
             const int s = b_idx / K;
             const int bi = b_idx % K;
             const int bj = (bi + s) % K;
@@ -705,7 +785,7 @@ std::vector<ScheduleLeaf> run_block_bvn_pipeline(
                     p->w += add;
                     r_ptr[p->u] += add;
                     c_ptr[p->v] += add;
-                    total_phantom += add;
+                    local_phantom += add;
                 }
             }
 
@@ -727,11 +807,14 @@ std::vector<ScheduleLeaf> run_block_bvn_pipeline(
                 *e_ptr++ = {static_cast<uint16_t>(u), static_cast<uint16_t>(v), add};
                 r_ptr[u] += add;
                 c_ptr[v] += add;
-                total_phantom += add;
+                local_phantom += add;
             }
             edges.resize(static_cast<size_t>(e_ptr - e_begin));
         }
-    }
+
+        #pragma omp atomic
+        total_phantom += local_phantom;
+    });
 
     int min_bdeg = 1e9, max_bdeg = 0, empty_cnt = 0, hotspot_cnt = 0;
     const int hotspot_thresh = (num_blocks < cfg.num_threads * 2)
@@ -780,13 +863,15 @@ std::vector<ScheduleLeaf> run_block_bvn_pipeline(
     std::vector<int> sched_to_shift;
     std::vector<ScheduleLeaf> global_leaves;
 
-    #pragma omp parallel num_threads(cfg.num_threads) reduction(+:sum_cleanup_ms)
-    {
+    run_in_domain_groups(G, cfg.num_threads, [&](int g, int groups) {
+        int s_lo, s_hi;
+        shift_range(g, groups, s_lo, s_hi);
         EulerWorkspace& tls_ws = get_thread_workspace();
+        double local_cleanup_ms = 0.0;
 
         // Step C.1 & C.2: Decompose each non-empty N_b x N_b block in L1 cache + local cleanup & empty-schedule compaction
         #pragma omp for schedule(dynamic, 1)
-        for (int b_idx = 0; b_idx < num_blocks; ++b_idx) {
+        for (int b_idx = s_lo * K; b_idx < s_hi * K; ++b_idx) {
             int db = block_deg[b_idx];
             if (db == 0) continue;
             const auto& edges = block_edges[b_idx];
@@ -911,38 +996,44 @@ std::vector<ScheduleLeaf> run_block_bvn_pipeline(
 
             double tc1 = omp_get_wtime();
             double c_ms = (tc1 - tc0) * 1000.0;
-            sum_cleanup_ms += c_ms;
+            local_cleanup_ms += c_ms;
             tls_ws.active_time_ms += c_ms;
         }
 
-        #pragma omp single
-        {
-            t_after_stepA = omp_get_wtime();
-            for (int s = 0; s < K; ++s) {
-                int d_max = 0;
-                for (int bi = 0; bi < K; ++bi) {
-                    d_max = std::max(d_max, block_deg[s * K + bi]);
-                }
-                shift_deg[s] = d_max;
-                shift_offset[s + 1] = shift_offset[s] + d_max;
-            }
-            total_schedules = shift_offset[K];
-            stats.regularized_degree = total_schedules;
-            global_leaves.resize(total_schedules);
-            sched_to_shift.resize(total_schedules);
-            for (int s = 0; s < K; ++s) {
-                std::fill(
-                    sched_to_shift.begin() + shift_offset[s],
-                    sched_to_shift.begin() + shift_offset[s + 1],
-                    s
-                );
-            }
-        }
+        #pragma omp atomic
+        sum_cleanup_ms += local_cleanup_ms;
+    });
 
-        // Step C.3: Flat 12-Thread Parallel AVX2 SIMD Fusion across all total_schedules leaves
+    t_after_stepA = omp_get_wtime();
+    for (int s = 0; s < K; ++s) {
+        int d_max = 0;
+        for (int bi = 0; bi < K; ++bi) {
+            d_max = std::max(d_max, block_deg[s * K + bi]);
+        }
+        shift_deg[s] = d_max;
+        shift_offset[s + 1] = shift_offset[s] + d_max;
+    }
+    total_schedules = shift_offset[K];
+    stats.regularized_degree = total_schedules;
+    global_leaves.resize(total_schedules);
+    sched_to_shift.resize(total_schedules);
+    for (int s = 0; s < K; ++s) {
+        std::fill(
+            sched_to_shift.begin() + shift_offset[s],
+            sched_to_shift.begin() + shift_offset[s + 1],
+            s
+        );
+    }
+
+    run_in_domain_groups(G, cfg.num_threads, [&](int g, int groups) {
+        int s_lo, s_hi;
+        shift_range(g, groups, s_lo, s_hi);
+        EulerWorkspace& tls_ws = get_thread_workspace();
+
+        // Step C.3: Parallel SIMD fusion of the schedules of this group's shifts [s_lo, s_hi)
         double tf0 = omp_get_wtime();
         #pragma omp for schedule(static)
-        for (int g_idx = 0; g_idx < total_schedules; ++g_idx) {
+        for (int g_idx = shift_offset[s_lo]; g_idx < shift_offset[s_hi]; ++g_idx) {
             const int s = sched_to_shift[g_idx];
             const int d = g_idx - shift_offset[s];
             ScheduleLeaf& g_leaf = global_leaves[g_idx];
@@ -976,7 +1067,7 @@ std::vector<ScheduleLeaf> run_block_bvn_pipeline(
             }
         }
         tls_ws.active_time_ms += (omp_get_wtime() - tf0) * 1000.0;
-    }
+    });
 
     double t2 = omp_get_wtime();
     out_phase1_ms = (t1 - t0) * 1000.0;
