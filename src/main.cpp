@@ -24,6 +24,9 @@ void print_usage(const char* prog) {
               << "  --blocks <int>       Spatial block grid KxK for omp_block (0 = dynamic optimal)\n"
               << "  --mode <str>         Execution mode: seq | omp_naive | omp_arch | omp_block (default: omp_arch)\n"
               << "  --pattern <str>      Traffic pattern: uniform | skewed | bursty (default: uniform)\n"
+              << "  --par-walk-min <int> omp_arch: data-parallel Euler split for tree-top splits with >= N edges\n"
+              << "                       (default: 0 = off, serial walk; e.g. 16384)\n"
+              << "  --no-par-walk        Force the serial Euler walk (same as --par-walk-min 0)\n"
               << "  --domains <int>      Thread groups pinned to place partitions, e.g. sockets/CCXs\n"
               << "                       (default: 1; 0 = one per OpenMP place, see OMP_PLACES)\n"
               << "  --seed <int>         RNG seed (default: 42)\n"
@@ -68,6 +71,10 @@ int main(int argc, char** argv) {
             cfg.cutoff_degree = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--blocks") == 0 && i + 1 < argc) {
             cfg.block_factor = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--par-walk-min") == 0 && i + 1 < argc) {
+            cfg.par_walk_min_edges = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--no-par-walk") == 0) {
+            cfg.par_walk_min_edges = 0;
         } else if (std::strcmp(argv[i], "--domains") == 0 && i + 1 < argc) {
             cfg.num_domains = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
@@ -304,7 +311,7 @@ int main(int argc, char** argv) {
                 std::cout << "   - Root Bitmask Build (Par)  : " << std::setw(8) << stats.sub_root_bitmask_ms
                           << " ms (" << std::setw(5) << std::setprecision(1) << (100.0 * stats.sub_root_bitmask_ms / total_safe) << "%)\n"
                           << std::setprecision(3)
-                          << "   - Root Euler Walk (1-Thread): " << std::setw(8) << stats.sub_root_walk_ms
+                          << "   - Root Euler Split (walk/col): " << std::setw(8) << stats.sub_root_walk_ms
                           << " ms (" << std::setw(5) << std::setprecision(1) << (100.0 * stats.sub_root_walk_ms / total_safe) << "%)\n"
                           << std::setprecision(3)
                           << "   - Root Partition (Parallel) : " << std::setw(8) << stats.sub_root_extract_ms

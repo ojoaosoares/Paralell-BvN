@@ -128,6 +128,7 @@ struct Config {
     int num_threads = 4;                          // OpenMP thread count
     int cutoff_degree = 8;                        // Task cut-off degree D_min for OMP_ARCH
     int block_factor = 0;                         // Spatial grid KxK blocks (0 = dynamic optimal selection)
+    int par_walk_min_edges = 0;                   // Min edges for a data-parallel Euler split at the tree top (0 = off)
     int num_domains = 1;                          // Thread groups bound to place partitions (0 = one per OpenMP place)
     uint64_t seed = 42;                           // RNG seed for reproducibility
     ExecMode mode = ExecMode::OMP_ARCH;           // Execution mode

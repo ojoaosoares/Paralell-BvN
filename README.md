@@ -89,3 +89,13 @@ OMP_PLACES="{0,2,4,...},{64,66,...}" OMP_PROC_BIND=spread \
 ```
 
 Use listas explícitas de *places* (o script as gera): em algumas versões do libgomp `OMP_PLACES=ll_caches`/`numa_domains` colapsa tudo em um único *place*, prendendo todas as threads ao primeiro CCX.
+
+## Divisão Euleriana Paralela no Topo da Árvore (`--par-walk-min`, experimental)
+
+No `omp_arch`, o nível k da árvore tem só 2^k subárvores; enquanto 2^k < T, cada split serial deixa threads ociosas. Com `--par-walk-min N`, splits do topo com ≥ N arestas (e a raiz) trocam a caminhada serial por uma partição Euleriana paralela:
+
+1. Em cada vértice, as arestas ímpares são emparelhadas (pares consecutivos); arestas pareadas precisam de cores diferentes, e a relação forma ciclos pares.
+2. Tasks (`omp taskloop`) crescem segmentos desses ciclos em paralelo, reivindicando arestas com CAS e colorindo-as relativamente ao início do segmento.
+3. Um union-find com paridade (sequencial, sobre os segmentos) decide qual segmento inverte as cores; o resultado é aplicado em paralelo.
+
+Fica **desligado por padrão**. Em um Ryzen 5 5500U (6 cores), N=2048, a coloração paralela da raiz leva ~27 ms contra ~12 ms da caminhada serial em bitmask: a caminhada usa 1 bit por par (u, v) residente em L2/L3, enquanto a partição precisa de ~16 B por aresta ímpar. O script mede a ablação (`par_walk_ablation.csv`) para verificar se, com dezenas de cores, o paralelismo extra compensa.

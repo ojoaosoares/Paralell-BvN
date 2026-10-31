@@ -20,7 +20,7 @@ read -r -a PATTERNS <<< "${PATTERNS:-uniform skewed bursty}"
 
 mkdir -p "${BUILD_DIR}" "${RESULTS_DIR}"
 
-echo "[1/7] Collecting Hardware & NUMA Topology..."
+echo "[1/8] Collecting Hardware & NUMA Topology..."
 lscpu > "${RESULTS_DIR}/lscpu.txt" || true
 if command -v numactl &> /dev/null; then
     numactl --hardware > "${RESULTS_DIR}/numactl_hardware.txt" || true
@@ -29,7 +29,7 @@ if command -v lstopo-no-graphics &> /dev/null; then
     lstopo-no-graphics > "${RESULTS_DIR}/hwloc_topology.txt" || true
 fi
 
-echo "[2/7] Pinning CPU frequency governor to 'performance' (best effort)..."
+echo "[2/8] Pinning CPU frequency governor to 'performance' (best effort)..."
 if command -v cpupower &> /dev/null; then
     sudo -n cpupower frequency-set -g performance > /dev/null 2>&1 \
         || echo "  cpupower failed (no sudo?); timings may include DVFS noise."
@@ -38,7 +38,7 @@ else
 fi
 cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor > "${RESULTS_DIR}/governor.txt" 2>/dev/null || true
 
-echo "[3/7] Building Release Binary (-O3 -march=native -fopenmp)..."
+echo "[3/8] Building Release Binary (-O3 -march=native -fopenmp)..."
 cmake -S "${ROOT_DIR}" -B "${BUILD_DIR}" -DCMAKE_BUILD_TYPE=Release
 cmake --build "${BUILD_DIR}" -j"$(nproc)"
 
@@ -106,7 +106,7 @@ run_case() {
 SCALING_CSV="${RESULTS_DIR}/scaling_results.csv"
 echo "${CSV_HEADER}" > "${SCALING_CSV}"
 
-echo "[4/7] Strong Scaling & Affinity Experiments (${REPS} reps, N in ${N_LIST[*]})..."
+echo "[4/8] Strong Scaling & Affinity Experiments (${REPS} reps, N in ${N_LIST[*]})..."
 for N in "${N_LIST[@]}"; do
     D="${N}"
     for P in "${PATTERNS[@]}"; do
@@ -136,7 +136,7 @@ if command -v numactl &> /dev/null; then
     DOMAIN_BINDINGS+=(interleave)
 fi
 
-echo "[5/7] NUMA / L3 Domain Mapping Experiments (${PHYS_CORES} threads: ${DOMAIN_BINDINGS[*]})..."
+echo "[5/8] NUMA / L3 Domain Mapping Experiments (${PHYS_CORES} threads: ${DOMAIN_BINDINGS[*]})..."
 for N in "${N_LIST[@]}"; do
     for P in "${PATTERNS[@]}"; do
         for ((r = 0; r < REPS; ++r)); do
@@ -150,10 +150,29 @@ for N in "${N_LIST[@]}"; do
     done
 done
 
+PARWALK_CSV="${RESULTS_DIR}/par_walk_ablation.csv"
+echo "par_walk_min,${CSV_HEADER}" > "${PARWALK_CSV}"
+
+echo "[6/8] Parallel Euler Split Ablation (omp_arch, serial walk vs --par-walk-min)..."
+for N in "${N_LIST[@]}"; do
+    for P in "${PATTERNS[@]}"; do
+        for T in "${THREAD_LIST[@]}"; do
+            [ "${T}" -lt 4 ] && continue
+            for MIN in 0 16384; do
+                for ((r = 0; r < REPS; ++r)); do
+                    line="$(OMP_PLACES=cores OMP_PROC_BIND=spread "${BIN}" --mode omp_arch --n "${N}" --d "${N}" \
+                        --pattern "${P}" --threads "${T}" --cutoff 8 --par-walk-min "${MIN}" --csv)" || line="TIMEOUT_OR_CRASH"
+                    echo "${MIN},${r},spread,${line}" >> "${PARWALK_CSV}"
+                done
+            done
+        done
+    done
+done
+
 CUTOFF_CSV="${RESULTS_DIR}/cutoff_sensitivity.csv"
 echo "${CSV_HEADER}" > "${CUTOFF_CSV}"
 
-echo "[6/7] Task Cut-off Granularity Sweep..."
+echo "[7/8] Task Cut-off Granularity Sweep..."
 for N in 512 2048; do
     for CUTOFF in 2 4 8 16 32 64 128; do
         for ((r = 0; r < REPS; ++r)); do
@@ -163,7 +182,7 @@ for N in 512 2048; do
     done
 done
 
-echo "[7/7] Collecting Hardware Performance Counters (perf stat)..."
+echo "[8/8] Collecting Hardware Performance Counters (perf stat)..."
 if command -v perf &> /dev/null; then
     # Generic LLC-* events are often unsupported on AMD; keep only events this CPU exposes.
     CANDIDATE_EVENTS=(cycles instructions cache-references cache-misses

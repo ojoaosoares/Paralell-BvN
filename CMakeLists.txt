@@ -16,6 +16,7 @@ add_executable(bvn_bench
     src/traffic.cpp
     src/regularizer.cpp
     src/euler_trail.cpp
+    src/euler_parallel.cpp
     src/decomposer_seq.cpp
     src/decomposer_naive.cpp
     src/decomposer_arch.cpp

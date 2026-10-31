@@ -1,4 +1,5 @@
 #include "bvn/decomposer.hpp"
+#include "bvn/euler_parallel.hpp"
 #include "bvn/regularizer.hpp"
 #include <algorithm>
 #include <cstdint>
@@ -84,6 +85,7 @@ bool euler_root_split_omp_arch(
     const Matrix& regularized_matrix,
     int n,
     int num_threads,
+    int par_walk_min_edges,
     std::vector<WeightedEdge>& out_red,
     std::vector<WeightedEdge>& out_blue,
     PipelineStats* stats
@@ -111,6 +113,9 @@ bool euler_root_split_omp_arch(
     std::vector<int> thread_blue_offset(num_threads + 1, 0);
 
     const int row_chunk = matrix_row_chunk(n, num_threads);
+    std::vector<int> row_off(n + 1, 0);  // odd edges per row, then exclusive prefix (edge ids)
+    std::vector<uint16_t> odd_u, odd_v;
+    std::vector<uint8_t> odd_color;
 
     double t_start = omp_get_wtime();
     double t_after_bitmask = t_start;
@@ -129,6 +134,7 @@ bool euler_root_split_omp_arch(
             const int* __restrict row = &regularized_matrix[static_cast<size_t>(u) * n];
             uint64_t* __restrict l_row = &adj_L[u * W];
             uint64_t sum_u = 0ULL;
+            int row_cnt = 0;
 
             for (int v = 0; v < n; ++v) {
                 int w = row[v];
@@ -136,21 +142,78 @@ bool euler_root_split_omp_arch(
                     int uw = v >> 6;
                     l_row[uw] |= (1ULL << (v & 63));
                     sum_u |= (1ULL << uw);
-                    ++local_odd_edges;
+                    ++row_cnt;
                 }
             }
             summary_L[u] = sum_u;
+            row_off[u + 1] = row_cnt;
+            local_odd_edges += row_cnt;
         }
 
         #pragma omp atomic
         total_odd_edges += local_odd_edges;
         #pragma omp barrier
 
+        // Same decision on every thread (total_odd_edges is shared and final after the barrier).
+        const bool par_walk = par_walk_min_edges > 0 && num_threads > 1 && total_odd_edges >= par_walk_min_edges;
+
+        if (par_walk) {
+            // Step 2 (parallel): enumerate odd edges row by row (ids = row prefix + rank in row),
+            // clearing adj_L as we go, then color them with the parallel Euler partition.
+            #pragma omp single
+            {
+                for (int u = 0; u < n; ++u) {
+                    row_off[u + 1] += row_off[u];
+                }
+                odd_u.resize(total_odd_edges);
+                odd_v.resize(total_odd_edges);
+                odd_color.resize(total_odd_edges);
+            }
+
+            #pragma omp for schedule(static, row_chunk)
+            for (int u = 0; u < n; ++u) {
+                uint64_t* __restrict l_row = &adj_L[u * W];
+                int k = row_off[u];
+                for (int w = 0; w < W; ++w) {
+                    uint64_t bits = l_row[w];
+                    while (bits != 0ULL) {
+                        odd_u[k] = static_cast<uint16_t>(u);
+                        odd_v[k] = static_cast<uint16_t>((w << 6) + __builtin_ctzll(bits));
+                        ++k;
+                        bits &= bits - 1ULL;
+                    }
+                    l_row[w] = 0ULL;
+                }
+                summary_L[u] = 0ULL;
+            }
+
+            #pragma omp single
+            {
+                t_after_bitmask = omp_get_wtime();
+                // The taskloops inside are executed by the whole team at this single's barrier.
+                color_odd_edges_parallel(
+                    n, total_odd_edges, odd_u.data(), odd_v.data(), true, odd_color.data(), 4 * num_threads
+                );
+                t_after_walk = omp_get_wtime();
+            }
+
+            #pragma omp for schedule(static, row_chunk)
+            for (int u = 0; u < n; ++u) {
+                uint64_t* __restrict r_row = &red_mask[u * W];
+                for (int k = row_off[u]; k < row_off[u + 1]; ++k) {
+                    if (odd_color[k] == 0) {
+                        const int v = odd_v[k];
+                        r_row[v >> 6] |= 1ULL << (v & 63);
+                    }
+                }
+            }
+        }
+
         // adj_R = transpose(adj_L), tile by tile. Scattering `adj_R[v * W + u_word] |= u_bit` from the
         // row loop made up to 8 threads write neighbouring words of one cache line (false sharing);
         // here the thread owning tile column V is the only writer of adj_R rows [64V, 64V + 64).
         // adj_R is all-zero on entry (the previous walk cleared every bit), so empty tiles are skipped.
-        if (total_odd_edges > 0) {
+        if (!par_walk && total_odd_edges > 0) {
             #pragma omp for schedule(static)
             for (int V = 0; V < W; ++V) {
                 const int v_base = V << 6;
@@ -182,61 +245,63 @@ bool euler_root_split_omp_arch(
             }
         }
 
-        // Step 2: Ultra-fast L1-resident 2-Level Hierarchical Bitmask + double TZCNT/BLSR Eulerian walk
-        #pragma omp single
-        {
-            t_after_bitmask = omp_get_wtime();
-            if (total_odd_edges > 0) {
-                for (int root = 0; root < n; ++root) {
-                    while (summary_L[root] != 0ULL) {
-                        int u = root;
-                        while (summary_L[u] != 0ULL) {
-                            uint64_t sum_u = summary_L[u];
-                            int uw = __builtin_ctzll(sum_u);
-                            uint64_t lmask = adj_L[u * W + uw];
-                            int v_bit = __builtin_ctzll(lmask);
-                            int v = (uw << 6) + v_bit;
+        // Step 2 (serial): Ultra-fast L1-resident 2-Level Hierarchical Bitmask + double TZCNT/BLSR Eulerian walk
+        if (!par_walk) {
+            #pragma omp single
+            {
+                t_after_bitmask = omp_get_wtime();
+                if (total_odd_edges > 0) {
+                    for (int root = 0; root < n; ++root) {
+                        while (summary_L[root] != 0ULL) {
+                            int u = root;
+                            while (summary_L[u] != 0ULL) {
+                                uint64_t sum_u = summary_L[u];
+                                int uw = __builtin_ctzll(sum_u);
+                                uint64_t lmask = adj_L[u * W + uw];
+                                int v_bit = __builtin_ctzll(lmask);
+                                int v = (uw << 6) + v_bit;
 
-                            uint64_t new_lmask = lmask & (lmask - 1ULL);
-                            adj_L[u * W + uw] = new_lmask;
-                            if (new_lmask == 0ULL) {
-                                summary_L[u] = sum_u & (sum_u - 1ULL);
+                                uint64_t new_lmask = lmask & (lmask - 1ULL);
+                                adj_L[u * W + uw] = new_lmask;
+                                if (new_lmask == 0ULL) {
+                                    summary_L[u] = sum_u & (sum_u - 1ULL);
+                                }
+
+                                int u_word = u >> 6;
+                                uint64_t new_rmask_u = adj_R[v * W + u_word] & ~(1ULL << (u & 63));
+                                adj_R[v * W + u_word] = new_rmask_u;
+                                if (new_rmask_u == 0ULL) {
+                                    summary_R[v] &= ~(1ULL << u_word);
+                                }
+                                red_mask[u * W + uw] |= (1ULL << v_bit);
+
+                                uint64_t sum_v = summary_R[v];
+                                int vw = __builtin_ctzll(sum_v);
+                                uint64_t rmask = adj_R[v * W + vw];
+                                int u_bit = __builtin_ctzll(rmask);
+                                int next_u = (vw << 6) + u_bit;
+
+                                uint64_t new_rmask = rmask & (rmask - 1ULL);
+                                adj_R[v * W + vw] = new_rmask;
+                                if (new_rmask == 0ULL) {
+                                    summary_R[v] = sum_v & (sum_v - 1ULL);
+                                }
+
+                                int v_word = v >> 6;
+                                uint64_t new_lmask_next = adj_L[next_u * W + v_word] & ~(1ULL << (v & 63));
+                                adj_L[next_u * W + v_word] = new_lmask_next;
+                                if (new_lmask_next == 0ULL) {
+                                    summary_L[next_u] &= ~(1ULL << v_word);
+                                }
+
+                                u = next_u;
+                                if (u == root) break;
                             }
-
-                            int u_word = u >> 6;
-                            uint64_t new_rmask_u = adj_R[v * W + u_word] & ~(1ULL << (u & 63));
-                            adj_R[v * W + u_word] = new_rmask_u;
-                            if (new_rmask_u == 0ULL) {
-                                summary_R[v] &= ~(1ULL << u_word);
-                            }
-                            red_mask[u * W + uw] |= (1ULL << v_bit);
-
-                            uint64_t sum_v = summary_R[v];
-                            int vw = __builtin_ctzll(sum_v);
-                            uint64_t rmask = adj_R[v * W + vw];
-                            int u_bit = __builtin_ctzll(rmask);
-                            int next_u = (vw << 6) + u_bit;
-
-                            uint64_t new_rmask = rmask & (rmask - 1ULL);
-                            adj_R[v * W + vw] = new_rmask;
-                            if (new_rmask == 0ULL) {
-                                summary_R[v] = sum_v & (sum_v - 1ULL);
-                            }
-
-                            int v_word = v >> 6;
-                            uint64_t new_lmask_next = adj_L[next_u * W + v_word] & ~(1ULL << (v & 63));
-                            adj_L[next_u * W + v_word] = new_lmask_next;
-                            if (new_lmask_next == 0ULL) {
-                                summary_L[next_u] &= ~(1ULL << v_word);
-                            }
-
-                            u = next_u;
-                            if (u == root) break;
                         }
                     }
                 }
+                t_after_walk = omp_get_wtime();
             }
-            t_after_walk = omp_get_wtime();
         }
 
         // Step 3: Parallel extraction of out_red and out_blue directly from regularized_matrix + red_mask
@@ -327,6 +392,7 @@ void decompose_recursive_omp_arch(
     int degree,
     int depth,
     int cutoff_degree,
+    int par_walk_min_edges,
     int leaf_offset,
     int node_id,
     std::vector<std::vector<WeightedEdge>>& node_buffers,
@@ -350,13 +416,24 @@ void decompose_recursive_omp_arch(
     if (red_edges.capacity() < edges.size()) red_edges.reserve(edges.size());
     if (blue_edges.capacity() < edges.size()) blue_edges.reserve(edges.size());
 
-    bool symmetric = euler_split_sequential_ws(edges, n, tls_ws, red_edges, blue_edges);
-    tls_ws.active_time_ms += (omp_get_wtime() - t0) * 1000.0;
+    // Top of the tree: fewer concurrent subtrees (2^depth) than threads, so a serial split would
+    // leave threads idle. Split this node data-parallel instead (its taskloops feed idle threads).
+    const int team = omp_get_num_threads();
+    const bool par_walk = par_walk_min_edges > 0 && team > 1 && depth < 30 && (1 << depth) < team &&
+                          static_cast<int>(edges.size()) >= par_walk_min_edges;
+    bool symmetric;
+    if (par_walk) {
+        // Chunk bodies account their own time on whichever thread runs them.
+        symmetric = euler_split_parallel(edges, n, 4 * team, tls_ws, red_edges, blue_edges);
+    } else {
+        symmetric = euler_split_sequential_ws(edges, n, tls_ws, red_edges, blue_edges);
+        tls_ws.active_time_ms += (omp_get_wtime() - t0) * 1000.0;
+    }
     int half_deg = degree >> 1;
 
     if (symmetric) {
         decompose_recursive_omp_arch(
-            red_edges, n, half_deg, depth + 1, cutoff_degree, leaf_offset, left_id, node_buffers, out_leaves
+            red_edges, n, half_deg, depth + 1, cutoff_degree, par_walk_min_edges, leaf_offset, left_id, node_buffers, out_leaves
         );
         double tc = omp_get_wtime();
         for (int i = 0; i < half_deg; ++i) {
@@ -364,16 +441,16 @@ void decompose_recursive_omp_arch(
         }
         tls_ws.active_time_ms += (omp_get_wtime() - tc) * 1000.0;
     } else {
-        #pragma omp task shared(out_leaves, node_buffers, red_edges) firstprivate(n, half_deg, depth, cutoff_degree, leaf_offset, left_id)
+        #pragma omp task shared(out_leaves, node_buffers, red_edges) firstprivate(n, half_deg, depth, cutoff_degree, par_walk_min_edges, leaf_offset, left_id)
         {
             decompose_recursive_omp_arch(
-                red_edges, n, half_deg, depth + 1, cutoff_degree, leaf_offset, left_id, node_buffers, out_leaves
+                red_edges, n, half_deg, depth + 1, cutoff_degree, par_walk_min_edges, leaf_offset, left_id, node_buffers, out_leaves
             );
         }
 
         // Execute right branch directly on the current thread to halve task creation overhead and preserve L1/L2 locality
         decompose_recursive_omp_arch(
-            blue_edges, n, half_deg, depth + 1, cutoff_degree, leaf_offset + half_deg, right_id, node_buffers, out_leaves
+            blue_edges, n, half_deg, depth + 1, cutoff_degree, par_walk_min_edges, leaf_offset + half_deg, right_id, node_buffers, out_leaves
         );
 
         #pragma omp taskwait
@@ -452,7 +529,7 @@ std::vector<ScheduleLeaf> decompose_omp_arch(
     std::vector<WeightedEdge>& red_edges = node_buffers[1];
     std::vector<WeightedEdge>& blue_edges = node_buffers[2];
     bool root_symmetric = euler_root_split_omp_arch(
-        regularized_matrix, n, cfg.num_threads, red_edges, blue_edges, stats
+        regularized_matrix, n, cfg.num_threads, cfg.par_walk_min_edges, red_edges, blue_edges, stats
     );
     int half_deg = degree >> 1;
 
@@ -467,7 +544,7 @@ std::vector<ScheduleLeaf> decompose_omp_arch(
             #pragma omp single
             {
                 decompose_recursive_omp_arch(
-                    g == 0 ? red_edges : blue_edges, n, half_deg, 1, cfg.cutoff_degree,
+                    g == 0 ? red_edges : blue_edges, n, half_deg, 1, cfg.cutoff_degree, cfg.par_walk_min_edges,
                     g * half_deg, 1 + g, node_buffers, leaves
                 );
             }
@@ -479,7 +556,7 @@ std::vector<ScheduleLeaf> decompose_omp_arch(
                 #pragma omp single
                 {
                     decompose_recursive_omp_arch(
-                        red_edges, n, half_deg, 1, cfg.cutoff_degree, 0, 1, node_buffers, leaves
+                        red_edges, n, half_deg, 1, cfg.cutoff_degree, cfg.par_walk_min_edges, 0, 1, node_buffers, leaves
                     );
                 }
                 double tc = omp_get_wtime();
@@ -494,11 +571,11 @@ std::vector<ScheduleLeaf> decompose_omp_arch(
                     #pragma omp task shared(leaves, node_buffers, red_edges) firstprivate(n, half_deg)
                     {
                         decompose_recursive_omp_arch(
-                            red_edges, n, half_deg, 1, cfg.cutoff_degree, 0, 1, node_buffers, leaves
+                            red_edges, n, half_deg, 1, cfg.cutoff_degree, cfg.par_walk_min_edges, 0, 1, node_buffers, leaves
                         );
                     }
                     decompose_recursive_omp_arch(
-                        blue_edges, n, half_deg, 1, cfg.cutoff_degree, half_deg, 2, node_buffers, leaves
+                        blue_edges, n, half_deg, 1, cfg.cutoff_degree, cfg.par_walk_min_edges, half_deg, 2, node_buffers, leaves
                     );
                     #pragma omp taskwait
                 }
@@ -882,7 +959,7 @@ std::vector<ScheduleLeaf> run_block_bvn_pipeline(
                     ? std::max(intra_block_cutoff, db >> 2)
                     : std::max(intra_block_cutoff, db >> 3);
                 decompose_recursive_omp_arch(
-                    edges, nb, db, 0, b_cutoff, 0, 0, block_node_buffers[b_idx], b_leaves
+                    edges, nb, db, 0, b_cutoff, cfg.par_walk_min_edges, 0, 0, block_node_buffers[b_idx], b_leaves
                 );
             } else {
                 double tb0 = omp_get_wtime();
