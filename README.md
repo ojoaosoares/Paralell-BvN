@@ -54,6 +54,16 @@ cmake --build build -j$(nproc)
 
 Nós recomendados (bare-metal, multi-socket): `r6525` (2× AMD EPYC 7543, Zen 3, 2 sockets × 8 CCDs) como alvo principal e `c6420` (2× Intel Xeon Gold 6142, Skylake-SP) como contraste Intel. O `c6525-25g`/`c6525-100g` é **single-socket** (EPYC 7302P/7402P) e não exercita NUMA entre sockets. Confira a especificação atual na página de hardware do CloudLab antes de reservar.
 
+Caminho mais curto em um nó novo (instala dependências, libera o `perf`, roda um teste de corretude e empacota os resultados em `bvn_<host>_<modo>_<data>.tar.gz`):
+
+```bash
+tmux new -s bvn                     # evita perder a execução se o SSH cair
+./scripts/cloudlab_run.sh quick     # ~15-30 min
+./scripts/cloudlab_run.sh full      # ~1-3 h
+```
+
+Execução manual da suíte:
+
 ```bash
 sudo sysctl kernel.perf_event_paranoid=-1   # libera contadores de hardware para o perf
 ./scripts/run_cloudlab_bench.sh
