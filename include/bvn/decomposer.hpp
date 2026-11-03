@@ -2,6 +2,7 @@
 
 #include "bvn/types.hpp"
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
