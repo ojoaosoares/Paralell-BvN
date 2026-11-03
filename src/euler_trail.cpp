@@ -1,4 +1,5 @@
 #include "bvn/euler_trail.hpp"
+#include <cstddef>
 #include <vector>
 
 namespace bvn {
@@ -77,12 +78,12 @@ void color_open_trails(
 
                 const auto& edges = open_trails[chosen_trail].edges;
                 if (forward) {
-                    for (size_t i = 0; i < edges.size(); ++i) {
+                    for (std::size_t i = 0; i < edges.size(); ++i) {
                         edge_color[edges[i]] = cur_color;
                         cur_color ^= 1;
                     }
                 } else {
-                    for (size_t i = edges.size(); i > 0; --i) {
+                    for (std::size_t i = edges.size(); i > 0; --i) {
                         edge_color[edges[i - 1]] = cur_color;
                         cur_color ^= 1;
                     }

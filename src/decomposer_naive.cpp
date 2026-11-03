@@ -1,5 +1,6 @@
 #include "bvn/decomposer.hpp"
 #include "bvn/euler_trail.hpp"
+#include <cstddef>
 #include <cstdint>
 #include <omp.h>
 #include <vector>
@@ -85,7 +86,7 @@ void euler_split_omp_naive(
                 }
 
                 if (curr == root) {
-                    for (size_t i = 0; i < trail_edges.size(); ++i) {
+                    for (std::size_t i = 0; i < trail_edges.size(); ++i) {
                         edge_color[trail_edges[i]] = static_cast<uint8_t>(i & 1);
                     }
                 } else {
