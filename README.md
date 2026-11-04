@@ -33,7 +33,9 @@ Proposta completa disponível em: [`docs/PROPOSTA.md`](docs/PROPOSTA.md).
 ├── profile.py                    # Perfil do CloudLab (geni-lib): nó bare-metal c6420 + setup automático
 └── scripts/
     ├── cloudlab/setup.sh         # Setup no boot do nó: dependências, perf, governor e build Release
-    └── run_cloudlab_bench.sh     # Suite automatizada de benchmarks e perf stat para nós CloudLab
+    ├── run_cloudlab_bench.sh     # Suite automatizada de benchmarks e perf stat para nós CloudLab
+    ├── run_statistical_bench.py  # Comparação de modos, escala extrema, strong scaling e padrões (30 repetições)
+    └── run_advanced_bench.py     # 5 baterias: perf stat, NUMA/afinidade, esparsidade, grid K×K, weak scaling
 ```
 
 ---
@@ -74,9 +76,13 @@ O binário fica em `/local/repository/build/bvn_bench`. A topologia detectada
 (`lscpu`, `numactl --hardware`) é salva em `/local/logs/`: nós `c6420` podem vir
 com 2 ou 4 nós NUMA, o que muda os resultados.
 
-### Rodando a suíte manualmente
+### Rodando as suítes manualmente
 
 ```bash
 cd /local/repository
-./scripts/run_cloudlab_bench.sh
+./scripts/run_cloudlab_bench.sh          # topologia, perf stat e varredura básica
+python3 scripts/run_statistical_bench.py # 30 repetições por ponto -> results_statistical_*/
+python3 scripts/run_advanced_bench.py    # 5 baterias arquiteturais -> results_advanced_*/
 ```
+
+Os scripts Python usam o binário já compilado em `build/bvn_bench`.
