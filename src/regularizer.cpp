@@ -15,15 +15,17 @@ int next_power_of_two(int x) {
 }
 } // namespace
 
-std::vector<int> regularize_matrix(
-    const std::vector<int>& demand_matrix,
+Matrix regularize_matrix(
+    const Matrix& demand_matrix,
     int n,
     int target_degree,
     ExecMode mode,
     int& out_regularized_degree,
     int64_t& out_phantom_added
 ) {
-    std::vector<int> reg_mat = demand_matrix;
+    const int num_threads = omp_get_max_threads();
+    const int chunk = matrix_row_chunk(n, num_threads);
+    Matrix reg_mat = (mode == ExecMode::SEQ) ? demand_matrix : first_touch_copy(demand_matrix, n, num_threads);
     std::vector<int> row_sum(n, 0);
     std::vector<int> col_sum(n, 0);
 
@@ -52,7 +54,7 @@ std::vector<int> regularize_matrix(
         {
             std::vector<int> local_col(n, 0);
 
-            #pragma omp for schedule(static) nowait
+            #pragma omp for schedule(static, chunk) nowait
             for (int u = 0; u < n; ++u) {
                 int rsum = 0;
                 const int* row_ptr = &reg_mat[static_cast<size_t>(u) * n];

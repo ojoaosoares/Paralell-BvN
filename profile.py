@@ -3,16 +3,17 @@
 Aloca um único nó físico (sem virtualização), instala as dependências,
 compila o `bvn_bench` em modo Release e deixa o ambiente pronto para
 `perf stat` e `numactl`. O repositório é clonado pelo CloudLab em
-`/local/repository`.
+`/local/repository`. Opcionalmente roda `scripts/cloudlab_run.sh` (quick ou full).
 
 Instructions:
 Depois que o nó ficar pronto (o setup leva poucos minutos), acompanhe o log com
 `tail -f /local/logs/bvn-setup.log`. O binário fica em
-`/local/repository/build/bvn_bench`. Para rodar a suíte completa:
+`/local/repository/build/bvn_bench`. Para rodar a suíte completa dentro de um tmux:
 
-    cd /local/repository && ./scripts/run_cloudlab_bench.sh
+    cd /local/repository && ./scripts/cloudlab_run.sh full
 
-Os resultados são gravados em `/local/repository/results_*`.
+Os resultados são gravados em `/local/repository/results_*` e empacotados em
+`/local/repository/bvn_<host>_<modo>_<data>.tar.gz`.
 """
 
 import geni.portal as portal
@@ -37,11 +38,14 @@ pc.defineParameter(
 )
 
 pc.defineParameter(
-    "runBench", "Rodar a suíte de benchmarks ao final do setup",
-    portal.ParameterType.BOOLEAN, False,
+    "benchMode", "Benchmark ao final do setup",
+    portal.ParameterType.STRING, "none",
+    legalValues=[("none", "Nenhum (só compila)"),
+                 ("quick", "quick: ~15-30 min"),
+                 ("full", "full: ~1-3 h")],
     longDescription=(
-        "Se marcado, executa scripts/run_cloudlab_bench.sh logo após compilar. "
-        "Pode levar bastante tempo; o progresso fica em /local/logs/bvn-bench.log."
+        "Roda scripts/cloudlab_run.sh no modo escolhido: teste de corretude, suíte de benchmarks "
+        "e tarball com os resultados em /local/repository. Progresso em /local/logs/bvn-bench.log."
     ),
 )
 
@@ -65,7 +69,7 @@ node.hardware_type = params.hwtype
 node.disk_image = params.image
 
 setup_cmd = "sudo /local/repository/scripts/cloudlab/setup.sh {bench} {gov}".format(
-    bench="--run-bench" if params.runBench else "",
+    bench="" if params.benchMode == "none" else "--run-bench=" + params.benchMode,
     gov="--perf-governor" if params.perfGovernor else "",
 )
 node.addService(pg.Execute(shell="bash", command=setup_cmd))

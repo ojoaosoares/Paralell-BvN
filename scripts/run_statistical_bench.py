@@ -26,7 +26,7 @@ print(f"Results Directory: {RESULTS_DIR}")
 print("=" * 60)
 
 raw_file = open(RAW_CSV, "w")
-raw_file.write("rep,mode,pattern,N,D,threads,cutoff,phase1_ms,phase2_3_ms,phase4_ms,total_ms,verified\n")
+raw_file.write("rep,mode,pattern,N,D,threads,cutoff,phase1_ms,phase2_3_ms,phase4_ms,total_ms,schedules,frame_eff,verified\n")
 raw_file.flush()
 
 configs = []
@@ -118,14 +118,14 @@ for idx, (mode, pattern, N, D, threads, cutoff, exp_group) in enumerate(unique_c
         raw_file.write(f"{rep},{out}\n")
         raw_file.flush()
         parts = out.split(",")
-        # Format: mode,pattern,N,D,threads,cutoff,phase1_ms,phase2_3_ms,phase4_ms,total_ms,verified
+        # Format: mode,pattern,N,D,threads,cutoff,phase1_ms,phase2_3_ms,phase4_ms,total_ms,schedules,frame_eff,verified
         if len(parts) >= 11:
             try:
                 p1 = float(parts[6])
                 p2_3 = float(parts[7])
                 p4 = float(parts[8])
                 tot = float(parts[9])
-                status = parts[10]
+                status = parts[-1]
                 data[key]["phase1"].append(p1)
                 data[key]["phase2_3"].append(p2_3)
                 data[key]["phase4"].append(p4)

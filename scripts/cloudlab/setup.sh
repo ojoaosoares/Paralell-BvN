@@ -2,7 +2,7 @@
 # ==============================================================================
 # CloudLab node setup for Parallel-BvN
 # Invoked by profile.py at every boot (as root). Safe to re-run.
-#   --run-bench      run scripts/run_cloudlab_bench.sh after building
+#   --run-bench=MODE run scripts/cloudlab_run.sh MODE (quick | full) after building
 #   --perf-governor  pin the CPU frequency governor to "performance"
 # ==============================================================================
 set -euo pipefail
@@ -13,11 +13,11 @@ SETUP_LOG="${LOG_DIR}/bvn-setup.log"
 BENCH_LOG="${LOG_DIR}/bvn-bench.log"
 MARKER="/local/.bvn-deps-installed"
 
-RUN_BENCH=0
+BENCH_MODE=""
 PERF_GOVERNOR=0
 for arg in "$@"; do
     case "${arg}" in
-        --run-bench) RUN_BENCH=1 ;;
+        --run-bench=quick|--run-bench=full) BENCH_MODE="${arg#--run-bench=}" ;;
         --perf-governor) PERF_GOVERNOR=1 ;;
         "") ;;
         *) echo "Unknown option: ${arg}" >&2; exit 1 ;;
@@ -76,7 +76,7 @@ grep -E "Model name|Socket|NUMA node\(s\)|^CPU\(s\)" "${LOG_DIR}/lscpu.txt" || t
 
 echo "=== Setup finished at $(date -Is). Binary: ${REPO_DIR}/build/bvn_bench ==="
 
-if [[ "${RUN_BENCH}" -eq 1 ]]; then
-    echo "Starting benchmark suite in background, log: ${BENCH_LOG}"
-    nohup bash -c "cd '${REPO_DIR}' && ./scripts/run_cloudlab_bench.sh" > "${BENCH_LOG}" 2>&1 &
+if [[ -n "${BENCH_MODE}" ]]; then
+    echo "Starting cloudlab_run.sh ${BENCH_MODE} in background, log: ${BENCH_LOG}"
+    nohup bash -c "cd '${REPO_DIR}' && ./scripts/cloudlab_run.sh '${BENCH_MODE}'" > "${BENCH_LOG}" 2>&1 &
 fi

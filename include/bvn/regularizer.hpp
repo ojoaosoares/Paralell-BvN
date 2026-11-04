@@ -10,8 +10,8 @@ namespace bvn {
  * Transforms an arbitrary traffic demand matrix M (N x N) with max line sum <= D
  * into a D-regular bipartite multigraph M_reg (N x N) where every row and column sums to D (a power of 2).
  */
-std::vector<int> regularize_matrix(
-    const std::vector<int>& demand_matrix,
+Matrix regularize_matrix(
+    const Matrix& demand_matrix,
     int n,
     int target_degree,
     ExecMode mode,

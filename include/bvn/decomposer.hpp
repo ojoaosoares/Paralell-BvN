@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 namespace bvn {
@@ -76,6 +77,12 @@ struct EulerWorkspace {
 EulerWorkspace& get_thread_workspace();
 
 /**
+ * Visits every EulerWorkspace ever created (one per OS thread, including nested-team threads).
+ * Must not run concurrently with parallel regions that use the workspaces.
+ */
+void for_each_thread_workspace(const std::function<void(EulerWorkspace&)>& fn);
+
+/**
  * Bitmask + TZCNT/BLSR Eulerian split using a pre-allocated workspace.
  * Returns true if the split is 100% symmetric (E_odd == 0, so Red and Blue subgraphs are identical).
  */
@@ -104,7 +111,7 @@ void decompose_recursive_seq_ws(
  * Baseline Sequential Eulerian BvN Decomposition.
  */
 std::vector<ScheduleLeaf> decompose_seq(
-    const std::vector<int>& regularized_matrix,
+    const Matrix& regularized_matrix,
     int n,
     int degree
 );
@@ -113,7 +120,7 @@ std::vector<ScheduleLeaf> decompose_seq(
  * Naive OpenMP Eulerian BvN Decomposition (unaligned cursors, unit-edge expansion, no task cutoff).
  */
 std::vector<ScheduleLeaf> decompose_omp_naive(
-    const std::vector<int>& regularized_matrix,
+    const Matrix& regularized_matrix,
     int n,
     int degree,
     int num_threads
@@ -124,7 +131,7 @@ std::vector<ScheduleLeaf> decompose_omp_naive(
  * (alignas(64) cursors, parity pre-halving, Bitmask TZCNT Workspace, calibrated task cut-off).
  */
 std::vector<ScheduleLeaf> decompose_omp_arch(
-    const std::vector<int>& regularized_matrix,
+    const Matrix& regularized_matrix,
     int n,
     int degree,
     const Config& cfg,
@@ -135,7 +142,7 @@ std::vector<ScheduleLeaf> decompose_omp_arch(
  * Dispatcher for Phases 2 & 3 according to cfg.mode.
  */
 std::vector<ScheduleLeaf> decompose_bvn(
-    const std::vector<int>& regularized_matrix,
+    const Matrix& regularized_matrix,
     int n,
     int degree,
     const Config& cfg,
@@ -150,7 +157,7 @@ int select_optimal_block_factor(
     int n,
     int num_threads,
     int requested_k = 0,
-    const std::vector<int>* demand_matrix = nullptr,
+    const Matrix* demand_matrix = nullptr,
     int target_degree = 0
 );
 
@@ -161,7 +168,7 @@ int select_optimal_block_factor(
  *    and Latin-square diagonal schedule fusion into global N-port permutations.
  */
 std::vector<ScheduleLeaf> run_block_bvn_pipeline(
-    const std::vector<int>& demand_matrix,
+    const Matrix& demand_matrix,
     const Config& cfg,
     PipelineStats& stats,
     double& out_phase1_ms,

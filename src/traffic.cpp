@@ -1,14 +1,44 @@
 #include "bvn/traffic.hpp"
 #include <algorithm>
+#include <omp.h>
 #include <random>
 #include <vector>
 
 namespace bvn {
 
-std::vector<int> generate_traffic_matrix(const Config& cfg, int64_t& out_total_packets) {
+Matrix make_first_touch_matrix(int n, int num_threads) {
+    Matrix mat(static_cast<size_t>(n) * n);
+    const int chunk = matrix_row_chunk(n, num_threads);
+    #pragma omp parallel for num_threads(num_threads) schedule(static, chunk)
+    for (int u = 0; u < n; ++u) {
+        int* row = &mat[static_cast<size_t>(u) * n];
+        for (int v = 0; v < n; ++v) {
+            row[v] = 0;
+        }
+    }
+    return mat;
+}
+
+Matrix first_touch_copy(const Matrix& src, int n, int num_threads) {
+    Matrix dst(static_cast<size_t>(n) * n);
+    const int chunk = matrix_row_chunk(n, num_threads);
+    #pragma omp parallel for num_threads(num_threads) schedule(static, chunk)
+    for (int u = 0; u < n; ++u) {
+        const int* s = &src[static_cast<size_t>(u) * n];
+        int* d = &dst[static_cast<size_t>(u) * n];
+        for (int v = 0; v < n; ++v) {
+            d[v] = s[v];
+        }
+    }
+    return dst;
+}
+
+Matrix generate_traffic_matrix(const Config& cfg, int64_t& out_total_packets) {
     const int n = cfg.n;
     const int D = cfg.target_degree;
-    std::vector<int> mat(static_cast<size_t>(n) * n, 0);
+    // RNG generation is sequential, but pages are first-touched in parallel beforehand so each
+    // row slab lives on the NUMA node of the thread that later processes it.
+    Matrix mat = make_first_touch_matrix(n, cfg.num_threads);
     std::vector<int> row_rem(n, D);
     std::vector<int> col_rem(n, D);
 

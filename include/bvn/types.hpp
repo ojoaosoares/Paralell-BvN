@@ -2,10 +2,62 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace bvn {
+
+/**
+ * Allocator whose value-initialization is a no-op, so `std::vector<T, NoInitAllocator<T>>(n)`
+ * reserves pages without touching them. Linux places each page on the NUMA node of the thread
+ * that first writes it (first-touch), so a parallel fill decides the page placement.
+ */
+template <class T>
+struct NoInitAllocator : std::allocator<T> {
+    template <class U>
+    struct rebind { using other = NoInitAllocator<U>; };
+
+    NoInitAllocator() noexcept = default;
+    template <class U>
+    NoInitAllocator(const NoInitAllocator<U>&) noexcept {}
+
+    template <class U, class... Args>
+    void construct(U* p, Args&&... args) {
+        if constexpr (sizeof...(Args) == 0) {
+            ::new (static_cast<void*>(p)) U;
+        } else {
+            ::new (static_cast<void*>(p)) U(std::forward<Args>(args)...);
+        }
+    }
+};
+
+/**
+ * Dense row-major N x N integer matrix (demand / regularized traffic) with first-touch placement.
+ */
+using Matrix = std::vector<int, NoInitAllocator<int>>;
+
+/**
+ * Row chunk for `schedule(static, chunk)` over the N rows of a Matrix: a multiple of 64 rows
+ * (disjoint uint64_t words in column bitmasks) that gives each thread one contiguous slab.
+ * Every row loop over a Matrix uses it, so each thread re-reads the pages it first-touched.
+ */
+inline int matrix_row_chunk(int n, int num_threads) {
+    const int row_words = (n + 63) >> 6;
+    const int t = num_threads > 0 ? num_threads : 1;
+    return ((row_words + t - 1) / t) * 64;
+}
+
+/**
+ * Allocates an N x N Matrix and zero-fills it in parallel with the matrix_row_chunk layout.
+ */
+Matrix make_first_touch_matrix(int n, int num_threads);
+
+/**
+ * Copies src into a new Matrix whose pages are first-touched with the matrix_row_chunk layout.
+ */
+Matrix first_touch_copy(const Matrix& src, int n, int num_threads);
 
 /**
  * Execution mode for Phase 2 & 3 (Eulerian Divide-and-Conquer + Leaf Extraction)
@@ -76,6 +128,8 @@ struct Config {
     int num_threads = 4;                          // OpenMP thread count
     int cutoff_degree = 8;                        // Task cut-off degree D_min for OMP_ARCH
     int block_factor = 0;                         // Spatial grid KxK blocks (0 = dynamic optimal selection)
+    int par_walk_min_edges = 0;                   // Min edges for a data-parallel Euler split at the tree top (0 = off)
+    int num_domains = 1;                          // Thread groups bound to place partitions (0 = one per OpenMP place)
     uint64_t seed = 42;                           // RNG seed for reproducibility
     ExecMode mode = ExecMode::OMP_ARCH;           // Execution mode
     TrafficPattern pattern = TrafficPattern::UNIFORM;
