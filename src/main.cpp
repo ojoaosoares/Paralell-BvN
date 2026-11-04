@@ -24,6 +24,11 @@ void print_usage(const char* prog) {
               << "  --blocks <int>       Spatial block grid KxK for omp_block (0 = dynamic optimal)\n"
               << "  --mode <str>         Execution mode: seq | omp_naive | omp_arch | omp_block (default: omp_arch)\n"
               << "  --pattern <str>      Traffic pattern: uniform | skewed | bursty (default: uniform)\n"
+              << "  --par-walk-min <int> omp_arch: data-parallel Euler split for tree-top splits with >= N edges\n"
+              << "                       (default: 0 = off, serial walk; e.g. 16384)\n"
+              << "  --no-par-walk        Force the serial Euler walk (same as --par-walk-min 0)\n"
+              << "  --domains <int>      Thread groups pinned to place partitions, e.g. sockets/CCXs\n"
+              << "                       (default: 1; 0 = one per OpenMP place, see OMP_PLACES)\n"
               << "  --seed <int>         RNG seed (default: 42)\n"
               << "  --metrics            Collect and print deep bottleneck telemetry\n"
               << "  --csv                Print single-line CSV output for benchmark scripts\n"
@@ -66,6 +71,12 @@ int main(int argc, char** argv) {
             cfg.cutoff_degree = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--blocks") == 0 && i + 1 < argc) {
             cfg.block_factor = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--par-walk-min") == 0 && i + 1 < argc) {
+            cfg.par_walk_min_edges = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--no-par-walk") == 0) {
+            cfg.par_walk_min_edges = 0;
+        } else if (std::strcmp(argv[i], "--domains") == 0 && i + 1 < argc) {
+            cfg.num_domains = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
             cfg.seed = static_cast<uint64_t>(std::atoll(argv[++i]));
         } else if (std::strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
@@ -111,7 +122,7 @@ int main(int argc, char** argv) {
     bvn::PipelineStats stats;
 
     // 0. Generate chaotic traffic matrix M
-    std::vector<int> demand_matrix = bvn::generate_traffic_matrix(cfg, stats.total_real_packets);
+    bvn::Matrix demand_matrix = bvn::generate_traffic_matrix(cfg, stats.total_real_packets);
 
     // Warm up OpenMP thread pool and thread-local workspaces so OS pthread/mmap page faults do not skew timers
     if (cfg.mode == bvn::ExecMode::OMP_BLOCK) {
@@ -160,7 +171,7 @@ int main(int argc, char** argv) {
     } else {
         // 1. Phase 1: Regularization (Padding)
         double t0 = omp_get_wtime();
-        std::vector<int> reg_matrix = bvn::regularize_matrix(
+        bvn::Matrix reg_matrix = bvn::regularize_matrix(
             demand_matrix,
             cfg.n,
             cfg.target_degree,
@@ -234,6 +245,12 @@ int main(int argc, char** argv) {
         stats.verified_ok = true;
     }
 
+    // Frame efficiency: fraction of the N x num_schedules port-slots carrying real traffic.
+    // Modes that inflate the frame (e.g. per-block power-of-2 padding) trade speed for throughput.
+    const double frame_efficiency = stats.num_schedules > 0
+        ? static_cast<double>(stats.total_real_packets) / (static_cast<double>(cfg.n) * stats.num_schedules)
+        : 0.0;
+
     if (cfg.csv_output) {
         std::cout << mode_to_str(cfg.mode) << ","
                   << pattern_to_str(cfg.pattern) << ","
@@ -246,6 +263,8 @@ int main(int argc, char** argv) {
                   << stats.phase2_3_euler_ms << ","
                   << stats.phase4_cleanup_ms << ","
                   << stats.total_ms << ","
+                  << stats.num_schedules << ","
+                  << std::setprecision(4) << frame_efficiency << ","
                   << (stats.verified_ok ? "PASS" : "FAIL") << "\n";
     } else {
         std::cout << "============================================================\n"
@@ -263,9 +282,12 @@ int main(int argc, char** argv) {
         }
         std::cout << " Regular Degree D : " << stats.regularized_degree << "\n"
                   << " OpenMP Threads   : " << cfg.num_threads << "\n"
+                  << " Domain Groups    : " << cfg.num_domains << (cfg.num_domains == 0 ? " (auto: OpenMP places)" : "") << "\n"
                   << " Task Cut-off Deg : " << cfg.cutoff_degree << "\n"
                   << " Real Packets     : " << stats.total_real_packets << "\n"
                   << " Phantom Padding  : " << stats.total_phantom_packets << "\n"
+                  << " Schedules (Frame): " << stats.num_schedules
+                  << " (efficiency " << std::fixed << std::setprecision(2) << (100.0 * frame_efficiency) << "%)\n"
                   << "------------------------------------------------------------\n"
                   << std::fixed << std::setprecision(3)
                   << " Phase 1 (Padding)          : " << std::setw(9) << stats.phase1_padding_ms << " ms\n"
@@ -289,7 +311,7 @@ int main(int argc, char** argv) {
                 std::cout << "   - Root Bitmask Build (Par)  : " << std::setw(8) << stats.sub_root_bitmask_ms
                           << " ms (" << std::setw(5) << std::setprecision(1) << (100.0 * stats.sub_root_bitmask_ms / total_safe) << "%)\n"
                           << std::setprecision(3)
-                          << "   - Root Euler Walk (1-Thread): " << std::setw(8) << stats.sub_root_walk_ms
+                          << "   - Root Euler Split (walk/col): " << std::setw(8) << stats.sub_root_walk_ms
                           << " ms (" << std::setw(5) << std::setprecision(1) << (100.0 * stats.sub_root_walk_ms / total_safe) << "%)\n"
                           << std::setprecision(3)
                           << "   - Root Partition (Parallel) : " << std::setw(8) << stats.sub_root_extract_ms
