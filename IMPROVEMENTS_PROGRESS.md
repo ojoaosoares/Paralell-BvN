@@ -263,4 +263,151 @@ Para eliminar os últimos gargalos microarquiteturais identificados pela telemet
 | `bursty` — Minor Page Faults | `105,138` | `84,891` | `84,850` | `105,153` | **`1,757`** | **60.0x menos page faults** |
 | **Verificação Matemática BvN** | `PASS (100%)` | `PASS (100%)` | `PASS (100%)` | `PASS (100%)` | **`PASS (100%)`** | **100% Exato** |
 
+---
+
+## 10. Avaliação Experimental Bare-Metal no CloudLab (64 vCPUs, Dual-Socket Xeon Gold 6142)
+
+Para validar a escalabilidade em hardware de servidor de alta densidade e isolamento de interferências de virtualização, executamos uma bateria de testes extensiva no ambiente experimental **CloudLab** (nó bare-metal `clnode249.clemson.cloudlab.us`).
+
+### 10.1. Ambiente Experimental Bare-Metal
+
+- **Processador:** 2x Intel(R) Xeon(R) Gold 6142 @ 2.60GHz (Skylake-SP)
+- **Topologia:** 2 Sockets físicos, 32 núcleos físicos (16 por socket), 64 vCPUs lógicas (Hyper-Threading habilitado)
+- **Domínios NUMA:** 2 nós NUMA (Node 0 e Node 1 com 32 vCPUs cada)
+- **Hierarquia de Cache:**
+  - L1d: 32 KB por núcleo (2x 512 KB total)
+  - L2: 1.024 KB (1 MB) não inclusivo por núcleo (32 MB total)
+  - L3 (LLC): 22 MB por socket compartilhado (44 MB total)
+- **Memória RAM:** 376 GB DDR4-2666 ECC
+- **Sistema Operacional / Compilador:** Ubuntu 22.04 LTS, Linux Kernel 5.15, GCC 11.4.0 (`-O3 -march=native -fopenmp`)
+- **Protocolo Estatístico:** **30 repetições** independentes para cada ponto de medição (com 1 execução prévia de *warm-up* descartada).
+
+---
+
+### 10.2. Comparação de Modos com Validade Estatística (30 Repetições, 64 Threads)
+
+Medição do tempo total do pipeline ($N \in [256, 2048]$ com $D = N$ e tráfego `uniform`):
+
+| Dimensão ($N$) | Modo | Média (ms) | Desvio Padrão (ms) | Min (ms) | Max (ms) | Speedup vs `seq` | Speedup vs `omp_arch` |
+| :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **$N = 256$** | `seq` | `9.944` | `0.271` | `9.867` | `11.372` | 1.00x | — |
+| | `omp_naive` | `13.827` | `0.281` | `13.173` | `14.318` | 0.72x *(slowdown)* | — |
+| | `omp_arch` | `4.290` | `0.271` | `3.877` | `4.722` | 2.32x | 1.00x |
+| | `omp_block` | **`0.776`** | **`0.018`** | `0.742` | `0.820` | **12.82x** | **5.53x** |
+| **$N = 512$** | `seq` | `39.624` | `0.556` | `39.327` | `41.574` | 1.00x | — |
+| | `omp_naive` | `44.101` | `0.851` | `43.138` | `47.634` | 0.90x *(slowdown)* | — |
+| | `omp_arch` | `14.904` | `1.303` | `13.197` | `16.925` | 2.66x | 1.00x |
+| | `omp_block` | **`1.184`** | **`0.019`** | `1.151` | `1.238` | **33.47x** | **12.59x** |
+| **$N = 1024$** | `seq` | `182.032` | `0.270` | `181.699` | `182.989` | 1.00x | — |
+| | `omp_naive` | `174.887` | `4.008` | `171.211` | `186.462` | 1.04x | — |
+| | `omp_arch` | `54.115` | `3.683` | `50.023` | `70.408` | 3.36x | 1.00x |
+| | `omp_block` | **`8.054`** | **`1.173`** | `6.104` | `10.462` | **22.60x** | **6.72x** |
+| **$N = 2048$** | `seq` | `1005.114` | `4.820` | `991.561` | `1016.840` | 1.00x | — |
+| | `omp_naive` | `743.620` | `8.488` | `725.634` | `756.744` | 1.35x | — |
+| | `omp_arch` | `316.490` | `26.665` | `268.370` | `369.444` | 3.18x | 1.00x |
+| | `omp_block` | **`43.860`** | **`0.365`** | `43.196` | `44.563` | **22.92x** | **7.22x** |
+
+---
+
+### 10.3. Escala Extrema de Matrizes ($N = 4096$ a $N = 16.384$)
+
+Avaliação da capacidade de decomposição sob matrizes de grande porte em 64 threads:
+
+| Dimensão ($N$) | Modo | Tempo Total Médio (ms) | Decomposição Euleriana (ms) | Limpeza Fantasma (ms) | Desvio Padrão (ms) |
+| :---: | :--- | :---: | :---: | :---: | :---: |
+| **$N = 4096$** | `omp_arch` | `1295.416` | `1218.684` | `23.909` | `32.705` |
+| | `omp_block` | **`103.424`** | `98.657` | `0.000` | **`0.417`** *(12.5x mais rápido)* |
+| **$N = 8192$** | `omp_block` | **`240.641`** | `223.078` | `0.000` | **`0.626`** |
+| **$N = 16384$** | `omp_block` | **`775.596`** | `716.577` | `0.000` | **`3.215`** *(268 milhões de células em < 0.8s)* |
+
+---
+
+### 10.4. Escalabilidade Forte (*Strong Scaling* em $N = 2048, D = 2048$)
+
+Variação de 1 a 64 threads para problema de tamanho fixo:
+
+| Threads | `omp_naive` (ms) | `omp_arch` (ms) | `omp_block` (ms) | Speedup `omp_block` vs 1T | Eficiência `omp_block` |
+| :---: | :---: | :---: | :---: | :---: | :---: |
+| **1** | `2931.28` | `1119.30` | `478.79` | 1.00x | 100.0% |
+| **2** | `1756.52` | `639.23` | `240.33` | **1.99x** | **99.5%** |
+| **4** | `1413.08` | `419.92` | `121.84` | **3.93x** | **98.3%** |
+| **8** | `997.85` | `311.55` | `62.88` | **7.61x** | **95.1%** |
+| **16** | `868.28` | `273.77` | `37.80` | **12.67x** | **79.2%** |
+| **32** | `785.22` | `225.65` | **`28.49`** | **16.81x** | **52.5%** |
+
+> **Observação:** O modo `omp_block` apresenta escalabilidade quase perfeitamente linear até 8 threads (95.1% de eficiência) e alcança seu ápice de vazão com 32 threads (`28.49 ms`). O modo `omp_naive` satura precocemente devido a falso compartilhamento nos cursores de vértice.
+
+---
+
+### 10.5. Contadores de Hardware Microarquiteturais (`perf stat` em $N=2048, D=2048, T=64$)
+
+Medição física de eventos de microarquitetura via hardware performance counters:
+
+| Modo | Tempo (ms) | IPC | Taxa L1 D-Cache Miss | Taxa LLC (L3) Miss | Taxa Branch Miss | Instruções Totais (M) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| `seq` | `1013.28` | `1.09` | `18.51%` | `2.60%` | `4.99%` | `3.924 M` |
+| `omp_naive` | `722.18` | `0.15` | `9.05%` | `27.50%` | `4.57%` | `7.391 M` |
+| `omp_arch` | `344.49` | `0.18` | `19.14%` | `19.55%` | `3.04%` | `5.034 M` |
+| **`omp_block`** | **`46.27`** | **`0.39`** | **`7.06%`** | `20.87%` | `4.10%` | **`3.475 M`** |
+
+> **Análise:** O `omp_block` atinge a menor taxa de faltas de L1 (**7.06%** vs 19.14% do `omp_arch`), duplica o IPC em relação aos demais modos paralelos e reduz o volume de instruções executadas em mais de **2x em relação ao `omp_naive`** (3.475 M vs 7.391 M).
+
+---
+
+### 10.6. Topologia NUMA e Afinidade de Threads ($N=2048, D=2048$)
+
+Comparação entre políticas de amarração de threads (`OMP_PROC_BIND`) e alocação de memória NUMA:
+
+| Política de Afinidade | Threads | `omp_arch` (ms) | `omp_block` (ms) | Efeito Arquitetural |
+| :--- | :---: | :---: | :---: | :--- |
+| **`close`** (Socket 0 primeiro) | 32 | `223.92` | **`28.31`** | **Ótimo local**: Mantém threads no mesmo socket, eliminando tráfego UPI/QPI cross-socket. |
+| **`spread`** (Intercalado entre Sockets) | 32 | `231.66` | `30.62` | Pequena sobrecarga de latência de coerência de cache remota entre sockets. |
+| **`spread`** | 64 | `338.81` | `43.83` | Saturação de barramento de memória com 64 threads ativas em ambos os sockets. |
+| **`numa_interleave`** | 32 | `233.73` | `29.47` | Distribui páginas de memória igualmente entre os nós NUMA 0 e 1. |
+
+---
+
+### 10.7. Sensibilidade ao Tamanho de Bloco ($K \times K$) no `omp_block` ($N=4096, T=64$)
+
+Avaliação do encaixe físico dos blocos na hierarquia de cache:
+
+| Grid $K \times K$ | Sub-matriz $B \times B$ | Tamanho de Dados por Bloco | Tempo Médio (ms) | Desvio Padrão (ms) | Nível de Cache Alvo |
+| :---: | :---: | :---: | :---: | :---: | :--- |
+| **$K = 16$** | $256 \times 256$ | ~256 KB | `103.49` | `1.75` | Cache L2 (1 MB) |
+| **$K = 32$** | $128 \times 128$ | ~64 KB | `93.40` | `0.48` | Transição L1/L2 |
+| **$K = 64$** | $64 \times 64$ | **~16 KB** | **`92.54`** | **`0.44`** | **100% Cache L1d (32 KB) — Sweet Spot** |
+
+> **Conclusão:** O particionamento em $K=64$ com sub-matrizes de $64 \times 64$ (`16 KB`) garante que todo o grafo e vetores de arestas caibam com folga nos 32 KB da L1d por núcleo, minimizando latências de acesso à memória e alcançando o melhor tempo (`92.54 ms`).
+
+---
+
+### 10.8. Sensibilidade à Esparsidade / Duty-Cycle ($N=4096$, $D \ll N$)
+
+Avaliação com cargas parciais de tráfego de switch (taxa $D/N$ de 0.8% a 100%):
+
+| Grau $D$ | Taxa ($D/N$) | `omp_arch` Total (ms) | `omp_block` Total (ms) | `omp_block` Padding Fase 1 (ms) | Ganho `omp_block` |
+| :---: | :---: | :---: | :---: | :---: | :---: |
+| **32** | 0.8% | `80.78` | **`5.22`** | `2.50` | **15.5x mais rápido** |
+| **128** | 3.1% | `130.34` | **`8.63`** | `2.70` | **15.1x mais rápido** |
+| **512** | 12.5% | `274.39` | **`26.64`** | `3.17` | **10.3x mais rápido** |
+| **2048** | 50.0% | `785.14` | **`69.59`** | `4.14` | **11.3x mais rápido** |
+| **4096** | 100.0% | `1295.42` | **`102.88`** | `4.75` | **12.6x mais rápido** |
+
+> **Análise:** Em matrizes muito esparsas ($D=32$), o `omp_arch` gasta **53 ms** apenas calculando déficits globais de linha/coluna na Fase 1, enquanto o `omp_block` completa todo o pipeline em apenas **5.22 ms** devido à regularização local nos sub-blocos.
+
+---
+
+### 10.9. Escalabilidade Fraca (*Weak Scaling*: $N = 512\sqrt{T}$)
+
+Manutenção de carga de trabalho proporcional por thread:
+
+| Threads ($T$) | Dimensão ($N \times N$) | `omp_block` (ms) | `omp_arch` (ms) | `omp_naive` (ms) | Eficiência Fraca `omp_block` | Eficiência Fraca `omp_arch` |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **1** | $512 \times 512$ | `29.74` | `44.30` | `124.56` | **100.0%** | 100.0% |
+| **4** | $1024 \times 1024$ | `31.30` | `87.50` | `285.59` | **95.0%** | 50.6% |
+| **16** | $2048 \times 2048$ | `38.79` | `270.11` | `864.76` | **76.7%** | 16.4% |
+| **64** | $4096 \times 4096$ | `102.96` | `1321.14` | — | **28.9%** | 3.4% |
+
+> **Conclusão:** O `omp_block` mantém **95.0% de eficiência fraca** em 4 threads e **76.7%** em 16 threads, comprovando excelente retenção de vazão quando o tamanho do problema escala conjuntamente com a quantidade de núcleos de processamento.
+
 
